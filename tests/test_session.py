@@ -1,6 +1,9 @@
 import asyncio
 import contextlib
 import gc
+import logging
+import re
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -39,6 +42,8 @@ async def test_forwards_session_metadata_then_telemetry(broker, recorder):
     link.disconnected.set()
     await asyncio.wait_for(task, 5)
     assert session.forwarded == 2
+    assert link.label == "test-device"  # log messages name the device by its ID from now on
+    assert re.fullmatch(r"after \ds \(2 messages to the cloud, 0 to the device\)", session.summary())
 
 
 async def test_mqtt_reconnect_republishes_metadata_and_keeps_messages(broker, recorder):
@@ -185,6 +190,8 @@ async def test_refused_ingest_key_is_logged_and_retried(mini_broker, caplog):
             await asyncio.sleep(0.05)
     # The message the README's troubleshooting table refers to.
     assert "[test-device] MQTT error: connection refused: Bad user name or password" in caplog.text
+    # A wrong key is a configuration error, not a passing network problem.
+    assert {r.levelno for r in caplog.records if "MQTT error" in r.getMessage()} == {logging.ERROR}
     assert broker.credentials[0] == ("test-device", "wrong")
     assert not link.notifying.is_set()  # nothing is requested from the device meanwhile
 
@@ -292,3 +299,67 @@ async def test_only_supported_message_types_are_acknowledged():
         protocol.encode_control(False, MessageType.TELEMETRY, 4),
     ]
     assert session._queue.qsize() == 1
+
+
+async def test_device_id_is_logged_escaped_but_used_unchanged(mini_broker, caplog):
+    caplog.set_level(logging.INFO)
+    broker = await mini_broker(return_code=4)
+    forged = "evil\n2026-11-19 10:00:00,000 INFO    [other] forged"
+    link = FakeLink(device_id=forged.encode())
+    settings = cloud.CloudSettings(ingest_key="k", host="127.0.0.1", port=broker.port, tls=False)
+    task = asyncio.create_task(DeviceSession(link, settings).run())
+    async with asyncio.timeout(10):
+        while not any("MQTT error" in r.getMessage() for r in caplog.records):
+            await asyncio.sleep(0.05)
+    link.disconnected.set()
+    await asyncio.wait_for(task, 5)
+
+    assert broker.credentials[0][0] == forged  # the cloud gets the device ID as reported
+    messages = [r.getMessage() for r in caplog.records]
+    assert not any("\n" in m for m in messages)
+    escaped = "evil\\n2026-11-19 10:00:00,000 INFO    [other] forged"
+    assert f"[{escaped}] Connected to fake-device AA:BB, protocol v1.1 ota=no" in messages
+
+
+async def test_malformed_messages_are_logged_with_the_device_and_rate_limited(caplog):
+    link = FakeLink()
+    session = DeviceSession(link, cloud.CloudSettings(ingest_key="k"))
+    for sequence in range(10):  # continuations without a first fragment
+        session._on_frame(bytes([MessageType.TELEMETRY, 0, sequence]) + b"orphan")
+    session._on_frame(b"\x02")  # too short to be a frame at all
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert warnings == [
+        f"[fake-device AA:BB] Dropping TELEMETRY seq={n}: continuation without first fragment" for n in range(5)
+    ]
+    assert session.rejected == 10
+
+
+def test_summary_of_a_session():
+    session = DeviceSession(FakeLink(), cloud.CloudSettings(ingest_key="k"))
+    assert session.summary() == ""  # the device was never set up
+    session.started = time.monotonic() - 250
+    session.forwarded, session.dropped, session.rejected = 5, 2, 1
+    session._downlinks = {
+        MessageType.DESIRED_CONFIGURATION: SimpleNamespace(delivered=2, failed=0),
+        MessageType.OTA_C2D: SimpleNamespace(delivered=1, failed=1),
+        MessageType.ARTIFACT_RESPONSE: SimpleNamespace(delivered=900, failed=3),  # firmware blocks
+    }
+    assert session.summary() == (
+        "after 4m 10s (5 messages to the cloud, 2 dropped, 3 to the device, 1 undelivered, "
+        "1 malformed from the device)"
+    )
+
+
+async def test_failed_write_without_message_is_still_described(caplog):
+    link = FakeLink()
+
+    async def timing_out_write(frame):
+        raise TimeoutError
+
+    link.write = timing_out_write
+    session = DeviceSession(link, cloud.CloudSettings(ingest_key="k"))
+    for frame in protocol.encode_frames(MessageType.OTA_D2C, 7, b"result", 20, needs_ack=True):
+        session._on_frame(frame)
+    while session._tasks:
+        await asyncio.sleep(0)
+    assert "Failed to write ACK for type 0x05 seq=7: TimeoutError" in caplog.text

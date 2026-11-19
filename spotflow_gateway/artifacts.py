@@ -35,6 +35,8 @@ from enum import IntEnum
 import certifi
 import httpx
 
+from .logs import DeviceLogger, Throttle, debug_traceback, describe
+
 log = logging.getLogger(__name__)
 # httpx logs every request URL at INFO (and httpcore internals at DEBUG). Artifact URLs
 # can carry signatures, so keep those loggers quiet regardless of the gateway's log level.
@@ -244,6 +246,9 @@ class ArtifactServer:
     ) -> None:
         self.cache = cache
         self.label = label
+        self._log = DeviceLogger(log, lambda: self.label)
+        # The warnings below are triggered by what the device sends.
+        self._throttle = Throttle()
         self._send = send
         self._queue: asyncio.Queue[bytes] = asyncio.Queue()
         # Requests queued or being answered. The device retransmits a pending request
@@ -253,7 +258,7 @@ class ArtifactServer:
 
     def submit(self, request: bytes) -> None:
         if request in self._pending:
-            log.debug("[%s] Ignoring retransmitted artifact request", self.label)
+            self._log.debug("Ignoring retransmitted artifact request")
             return
         self._pending.add(request)
         self._queue.put_nowait(request)
@@ -262,31 +267,48 @@ class ArtifactServer:
         while True:
             request = await self._queue.get()
             try:
-                response = await self.handle(request)
-                if response is not None:
-                    await self._send(response)
-            except Exception as exc:  # e.g. BLE write failure; the device will retransmit
-                log.warning("[%s] Failed to answer artifact request: %s", self.label, exc)
+                await self._answer(request)
             finally:
                 self._pending.discard(request)
 
+    async def _answer(self, request: bytes) -> None:
+        try:
+            response = await self.handle(request)
+        except Exception as exc:
+            # A bug, as handle() turns expected failures into a status for the device.
+            # Only the type is logged: the message (or a traceback with it) could quote
+            # the download link. The device retransmits the request.
+            self._log.error("Unexpected %s while handling an artifact request", type(exc).__name__)
+            return
+        if response is None:
+            return
+        try:
+            await self._send(response)
+        except Exception as exc:  # e.g. BLE write failure; the device will retransmit
+            self._log.warning("Failed to answer artifact request: %s", describe(exc),
+                              exc_info=debug_traceback(self._log))
+
+    def _warn(self, msg: str, *args: object) -> None:
+        if self._throttle.allow():
+            self._log.warning(msg + self._throttle.suppressed_note(), *args)
+
     async def handle(self, request: bytes) -> bytes | None:
         if len(request) < HEADER.size:
-            log.warning("[%s] Ignoring too-short artifact request", self.label)
+            self._warn("Ignoring too-short artifact request")
             return None
         op, transfer_id, request_id = HEADER.unpack_from(request)
         header = HEADER.pack(op | RESPONSE_FLAG, transfer_id, request_id)
         handler = {OP_OPEN: self._open, OP_READ: self._read, OP_CLOSE: self._close}.get(op)
         if handler is None:
-            log.warning("[%s] Ignoring artifact request with unknown operation %d", self.label, op)
+            self._warn("Ignoring artifact request with unknown operation %d", op)
             return None
         try:
             if transfer_id == 0:
                 raise ArtifactError(Status.INVALID_REQUEST, "transfer ID must be non-zero")
             return header + bytes([Status.OK]) + await handler(transfer_id, request[HEADER.size :])
         except ArtifactError as exc:
-            log.warning("[%s] Artifact %s failed: %s (status %d)", self.label,
-                        {OP_OPEN: "OPEN", OP_READ: "READ", OP_CLOSE: "CLOSE"}[op], exc, exc.status)
+            self._warn("Artifact %s failed: %s (status %d)",
+                       {OP_OPEN: "OPEN", OP_READ: "READ", OP_CLOSE: "CLOSE"}[op], exc, exc.status)
             return header + bytes([exc.status])
 
     async def _open(self, transfer_id: int, body: bytes) -> bytes:
@@ -303,7 +325,7 @@ class ArtifactServer:
 
         artifact = await self.cache.get(url_bytes.decode("ascii"), secret_bytes.decode("ascii"))
         self._transfers[transfer_id] = artifact
-        log.info("[%s] Artifact transfer %08x opened (%d bytes)", self.label, transfer_id, artifact.size)
+        self._log.info("Artifact transfer %08x opened (%d bytes)", transfer_id, artifact.size)
         return struct.pack("<I", artifact.size)
 
     async def _read(self, transfer_id: int, body: bytes) -> bytes:
@@ -326,8 +348,7 @@ class ArtifactServer:
         if len(data) != count:
             raise ArtifactError(Status.TRANSIENT_FAILURE, "cached artifact is truncated")
         if offset + count == artifact.size or offset % (64 * 1024) < count:
-            log.info("[%s] Artifact transfer %08x: %d/%d bytes", self.label, transfer_id,
-                     offset + count, artifact.size)
+            self._log.info("Artifact transfer %08x: %d/%d bytes", transfer_id, offset + count, artifact.size)
         return struct.pack("<I", offset) + data
 
     async def _close(self, transfer_id: int, body: bytes) -> bytes:
@@ -336,6 +357,6 @@ class ArtifactServer:
         consumed, reason = struct.unpack("<IB", body)
         # Repeated CLOSE must succeed, so an unknown transfer is not an error.
         if self._transfers.pop(transfer_id, None) is not None:
-            log.info("[%s] Artifact transfer %08x closed (%s, %d bytes consumed)", self.label,
-                     transfer_id, "complete" if reason == 0 else "interrupted", consumed)
+            self._log.info("Artifact transfer %08x closed (%s, %d bytes consumed)",
+                           transfer_id, "complete" if reason == 0 else "interrupted", consumed)
         return b""

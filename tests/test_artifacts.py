@@ -315,3 +315,36 @@ async def test_evicted_artifact_reports_transient_failure(server, tmp_path):
     for f in tmp_path.iterdir():
         f.unlink()
     assert (await server.handle(read_req(1, 3, 0, 4)))[9] == Status.TRANSIENT_FAILURE
+
+
+async def test_unexpected_error_is_logged_without_its_message(server, monkeypatch, caplog):
+    caplog.set_level(logging.DEBUG)
+
+    async def failing_get(url, secret):
+        raise RuntimeError(f"cannot fetch {url} with {secret}")  # e.g. a library error quoting the link
+
+    monkeypatch.setattr(server.cache, "get", failing_get)
+    await server._answer(open_req(1, 2))
+    assert [r.getMessage() for r in caplog.records] == [
+        "[dev] Unexpected RuntimeError while handling an artifact request"
+    ]
+    assert not caplog.records[0].exc_info  # a traceback would end with the message
+    assert SECRET not in caplog.text and "topsecretsignature" not in caplog.text
+
+
+async def test_failed_answer_is_described(tmp_path, origin, caplog):
+    async def timing_out_send(response):
+        raise TimeoutError
+
+    server = ArtifactServer(make_cache(tmp_path, origin), send=timing_out_send, label="dev")
+    await server._answer(close_req(1, 2, 0))
+    assert "[dev] Failed to answer artifact request: TimeoutError" in caplog.text
+
+
+async def test_warnings_the_device_can_trigger_are_rate_limited(server, caplog):
+    for request_id in range(10):
+        assert await server.handle(read_req(1, request_id, 0, 4)) is not None  # READ before OPEN
+        assert await server.handle(b"\x02") is None  # too short
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 5
+    assert warnings[0] == "[dev] Artifact READ failed: READ for unknown transfer (status 1)"

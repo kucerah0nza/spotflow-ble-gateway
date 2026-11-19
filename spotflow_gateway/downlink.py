@@ -15,6 +15,7 @@ from collections.abc import Callable
 
 from . import protocol
 from .ble import DeviceLink
+from .logs import DeviceLogger, debug_traceback, describe
 from .protocol import Control
 
 log = logging.getLogger(__name__)
@@ -33,11 +34,16 @@ class DownlinkChannel:
         ack_timeout: float = 3.0,
         max_attempts: int = 5,
         on_undelivered: Callable[[], None] | None = None,
+        quiet: bool = False,
     ) -> None:
         self.link = link
         self.message_type = message_type
         self.needs_ack = needs_ack
-        self.label = label or link.name
+        self.label = label or link.label
+        self._log = DeviceLogger(log, lambda: self.label)
+        # Log each delivered message at DEBUG instead of INFO (artifact blocks: hundreds
+        # per firmware update).
+        self._delivery_level = logging.DEBUG if quiet else logging.INFO
         self.frame_size = frame_size
         self.ack_timeout = ack_timeout
         self.max_attempts = max_attempts
@@ -55,7 +61,7 @@ class DownlinkChannel:
         """Queue a complete message for delivery (never blocks)."""
         if self._queue.full():
             self._queue.get_nowait()
-            log.warning("[%s] %s queue full, dropping oldest", self.label, self.message_type.name)
+            self._log.warning("%s queue full, dropping oldest", self.message_type.name)
         self._queue.put_nowait(payload)
 
     def on_control(self, control: Control) -> None:
@@ -73,7 +79,8 @@ class DownlinkChannel:
             try:
                 delivered = await self.send(payload)
             except Exception as exc:  # BLE write failures; the session handles disconnects
-                log.warning("[%s] Failed to write %s: %s", self.label, self.message_type.name, exc)
+                self._log.warning("Failed to write %s: %s", self.message_type.name, describe(exc),
+                                  exc_info=debug_traceback(self._log))
                 self.failed += 1
                 delivered = False
             if not delivered and self.on_undelivered is not None:
@@ -98,10 +105,12 @@ class DownlinkChannel:
         )
         if not self.needs_ack:
             await self._write(frames)
-            log.debug("[%s] -> device %s (%d bytes)", self.label, name, len(payload))
+            self._log.log(self._delivery_level, "-> device %s (%d bytes), sent without acknowledgement",
+                          name, len(payload))
             return True
 
         loop = asyncio.get_running_loop()
+        outcome = "not sent"
         for attempt in range(1, self.max_attempts + 1):
             future: asyncio.Future[bool] = loop.create_future()
             self._waiting = (sequence, future)  # before writing, so a fast ACK is not missed
@@ -109,16 +118,21 @@ class DownlinkChannel:
                 await self._write(frames)
                 with contextlib.suppress(TimeoutError):
                     if await asyncio.wait_for(future, self.ack_timeout):
-                        log.info("[%s] -> device %s (%d bytes), acknowledged", self.label, name, len(payload))
+                        self._log.log(self._delivery_level, "-> device %s (%d bytes), acknowledged",
+                                      name, len(payload))
                         return True
             finally:
                 self._waiting = None
-            outcome = "rejected (NACK)" if future.done() else "not acknowledged"
-            log.warning("[%s] %s seq=%d %s, attempt %d/%d",
-                        self.label, name, sequence, outcome, attempt, self.max_attempts)
-            if attempt < self.max_attempts:
-                await asyncio.sleep(min(0.5 * 2 ** (attempt - 1), 8.0))
-        log.error("[%s] Giving up delivering %s seq=%d", self.label, name, sequence)
+            # On a timeout, wait_for() cancels the future: only a result means a NACK.
+            outcome = "rejected (NACK)" if future.done() and not future.cancelled() else "not acknowledged"
+            if attempt == self.max_attempts:
+                break
+            # Retries are routine over BLE; only giving up is an error.
+            self._log.info("%s seq=%d %s, retrying (attempt %d/%d)",
+                           name, sequence, outcome, attempt, self.max_attempts)
+            await asyncio.sleep(min(0.5 * 2 ** (attempt - 1), 8.0))
+        self._log.error("Giving up delivering %s seq=%d after %d attempts, the last one %s",
+                        name, sequence, self.max_attempts, outcome)
         return False
 
     async def _write(self, frames: list[bytes]) -> None:

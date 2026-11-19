@@ -1,4 +1,5 @@
 import asyncio
+import logging
 
 from spotflow_gateway.ble import WriteGate
 
@@ -38,9 +39,13 @@ async def test_gives_up_pacing_when_flag_never_clears():
     assert peripheral.polls == polls
 
 
-async def test_gives_up_pacing_when_flag_is_unavailable():
+async def test_gives_up_pacing_when_flag_is_unavailable(caplog):
+    caplog.set_level(logging.DEBUG)
     peripheral = Peripheral(error=AttributeError("canSendWriteWithoutResponse"))
-    gate = WriteGate(peripheral)
+    gate = WriteGate(peripheral, lambda: "sensor-042")
     await gate.wait()
     await gate.wait()
     assert peripheral.polls == 1
+    assert caplog.messages == [
+        "[sensor-042] Write flow control unavailable (canSendWriteWithoutResponse), writing unpaced"
+    ]

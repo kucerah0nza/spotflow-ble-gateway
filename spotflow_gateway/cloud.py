@@ -53,6 +53,16 @@ class CloudError(Exception):
     """The MQTT connection failed, was refused, or was lost."""
 
 
+class CloudAuthError(CloudError):
+    """The broker refused the credentials: retrying will not help until they are fixed."""
+
+
+# CONNACK reason codes for refused credentials (MQTT 5 codes; paho maps the MQTT 3.1.1
+# return codes 4 and 5 to them).
+BAD_CREDENTIALS = 0x86
+NOT_AUTHORIZED = 0x87
+
+
 class CloudConnection:
     """A single MQTT session authenticated as ``device_id`` with the gateway's ingest key.
 
@@ -105,6 +115,10 @@ class CloudConnection:
             raise CloudError("timed out waiting for the broker to accept the connection") from None
         if reason is None:
             raise CloudError(self._disconnect_reason)
+        if reason.value == BAD_CREDENTIALS:
+            raise CloudAuthError(f"connection refused: {reason} (check the ingest key)")
+        if reason.value == NOT_AUTHORIZED:
+            raise CloudAuthError(f"connection refused: {reason}")
         if reason.is_failure:
             raise CloudError(f"connection refused: {reason}")
 

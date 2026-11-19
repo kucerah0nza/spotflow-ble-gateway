@@ -259,6 +259,7 @@ class FakeLink:
 
     def __init__(self, device_id=b"test-device", capabilities=b"\x01\x01\x00", metadata=b"\xa1\x00\x01"):
         self.name = "fake-device"
+        self.label = "fake-device AA:BB"
         self.disconnected = asyncio.Event()
         self.values = {
             protocol.CAPABILITIES_UUID: capabilities,

@@ -116,11 +116,17 @@ delay of up to one minute. Stop the gateway with Ctrl+C (or `SIGTERM` on Linux a
 disconnects all devices before exiting. Example output:
 
 ```
+2026-11-18 10:15:02,101 INFO    Spotflow BLE gateway 0.1.0 (Python 3.13.7, bleak 1.1.1, paho-mqtt 2.1.0, Linux-6.8.0-aarch64)
 2026-11-18 10:15:02,114 INFO    Scanning for Spotflow BLE devices (MQTT broker mqtt.spotflow.io:8883)
-2026-11-18 10:15:07,530 INFO    Connecting to Spotflow BLE device (C4:3F:2A:91:0B:7E, RSSI -58)
-2026-11-18 10:15:08,912 INFO    [sensor-042] Connected to Spotflow BLE device, protocol v1.1 ota=yes
+2026-11-18 10:15:07,530 INFO    [Spotflow BLE device C4:3F:2A:91:0B:7E] Connecting (RSSI -58)
+2026-11-18 10:15:08,912 INFO    [sensor-042] Connected to Spotflow BLE device C4:3F:2A:91:0B:7E, protocol v1.1 ota=yes
 2026-11-18 10:15:09,377 INFO    [sensor-042] MQTT connected to mqtt.spotflow.io
+2026-11-18 12:18:41,006 INFO    [sensor-042] Session ended after 2h 03m (1520 messages to the cloud, 3 to the device): the device disconnected
 ```
+
+Each line about a device starts with the device ID in brackets or, until the device has reported
+its ID, its advertised name and address. If the gateway finds no device, it logs
+`No Spotflow devices in range, still scanning` (at most every 10 minutes).
 
 ### Options
 
@@ -128,7 +134,7 @@ disconnects all devices before exiting. Example output:
 |---|---|
 | `--ingest-key KEY` | Spotflow ingest key. Defaults to the `SPOTFLOW_INGEST_KEY` environment variable. Prefer the environment variable: command-line arguments are visible to other users of the host. |
 | `--name PATTERN` | Connect only to devices whose advertised BLE name matches this pattern (`*` and `?` wildcards). Can be given several times. Example: `--name 'Spotflow*'`. |
-| `-v`, `--verbose` | Debug logging, including every forwarded message (its topic and size, never its content). |
+| `-v`, `--verbose` | Debug logging, including every forwarded message (its topic and size, never its content), which module logged each line, and tracebacks of unexpected errors. |
 
 ## Running as a service (Linux)
 
@@ -183,6 +189,9 @@ systemd:
    sudo systemctl enable --now spotflow-gateway
    journalctl -u spotflow-gateway -f
    ```
+
+   Under systemd, the gateway leaves timestamps to the journal and tags each line with its
+   severity, so `journalctl -u spotflow-gateway -p warning` shows only warnings and errors.
 
 On macOS and Windows, run the gateway under the service manager you already use (for example
 launchd or the Windows Task Scheduler) with the same environment variable.
@@ -251,7 +260,7 @@ every device supports, and switches to larger writes once the device has shown i
 
 | Symptom | What to check |
 |---|---|
-| No devices found | The device is powered, advertising and in range, and not connected to another gateway or app. On macOS, allow Bluetooth access for the terminal or app running the gateway (System Settings → Privacy & Security → Bluetooth). On Linux, check that `bluetoothd` is running and the adapter is on (`bluetoothctl show`). |
+| No devices found (`No Spotflow devices in range`) | If the log says `Ignoring Spotflow device ...: its name does not match --name`, adjust `--name`. Otherwise, check that the device is powered, advertising and in range, and not connected to another gateway or app. On macOS, allow Bluetooth access for the terminal or app running the gateway (System Settings → Privacy & Security → Bluetooth). On Linux, check that `bluetoothd` is running and the adapter is on (`bluetoothctl show`). |
 | `MQTT error: connection refused: Bad user name or password` | The ingest key is wrong or has been revoked. |
 | `MQTT error: cannot connect to mqtt.spotflow.io` | Network access to `mqtt.spotflow.io` on TCP port 8883 (firewall, proxy, DNS). |
 | `unsupported protocol version` | The device firmware uses a newer protocol version than this gateway. Update the gateway. |
@@ -261,8 +270,8 @@ every device supports, and switches to larger writes once the device has shown i
 | `Artifact OPEN failed: ... is not a public address` | The firmware download location resolves to a private or local address, which the gateway refuses (see [Security](#security)). |
 | A device is missing from Spotflow | Run with `-v` to see whether the gateway connects to it and forwards messages, and check the device ID it reports. |
 
-Run with `-v` for detailed logs. If you report a problem, include the gateway log, the
-operating system, and the Device SDK version used by the device.
+Run with `-v` for detailed logs. If you report a problem, include the gateway log (its first
+line gives the gateway version and the platform) and the Device SDK version used by the device.
 
 ## Development
 

@@ -49,14 +49,19 @@ async def test_authenticates_as_the_device_with_the_ingest_key(mini_broker):
 
 
 @pytest.mark.parametrize(
-    "return_code, reason",
-    [(4, "Bad user name or password"), (5, "Not authorized")],
+    "return_code, error, message",
+    [
+        (4, cloud.CloudAuthError, r"Bad user name or password \(check the ingest key\)"),
+        (5, cloud.CloudAuthError, "Not authorized"),
+        (3, cloud.CloudError, "Server unavailable"),
+    ],
 )
-async def test_refused_connection_reports_the_reason(mini_broker, return_code, reason):
+async def test_refused_connection_reports_the_reason(mini_broker, return_code, error, message):
     broker = await mini_broker(return_code=return_code)
     async with connection_to(broker) as connection:
-        with pytest.raises(cloud.CloudError, match=f"^connection refused: {reason}$"):
+        with pytest.raises(cloud.CloudError, match=f"^connection refused: {message}$") as raised:
             await connection.connect()
+    assert raised.type is error
 
 
 async def test_refused_connection_does_not_leak_the_ingest_key(mini_broker):

@@ -13,6 +13,7 @@ from bleak import BleakClient
 from bleak.backends.device import BLEDevice
 
 from . import protocol
+from .logs import DeviceLogger, printable
 
 log = logging.getLogger(__name__)
 
@@ -21,6 +22,8 @@ class DeviceLink(Protocol):
     """What a session needs from the BLE connection (implemented by BleLink and test fakes)."""
 
     name: str
+    # Prefix of the device's log messages; the session changes it to the device ID.
+    label: str
     disconnected: asyncio.Event
 
     async def read(self, uuid: str) -> bytes: ...
@@ -40,8 +43,9 @@ class WriteGate:
     POLL_S = 0.002
     TIMEOUT_S = 0.5
 
-    def __init__(self, peripheral: Any) -> None:
+    def __init__(self, peripheral: Any, label: Callable[[], str] = lambda: "") -> None:
         self._peripheral = peripheral  # CBPeripheral
+        self._log = DeviceLogger(log, label)
 
     async def wait(self) -> None:
         if self._peripheral is None:
@@ -51,12 +55,12 @@ class WriteGate:
             while not self._peripheral.canSendWriteWithoutResponse():
                 if asyncio.get_running_loop().time() >= deadline:
                     # The flag never became true; do not slow every write down for it.
-                    log.debug("Write flow control unavailable, writing unpaced")
+                    self._log.debug("Write flow control unavailable, writing unpaced")
                     self._peripheral = None
                     return
                 await asyncio.sleep(self.POLL_S)
         except Exception as exc:
-            log.debug("Write flow control unavailable (%s), writing unpaced", exc)
+            self._log.debug("Write flow control unavailable (%s), writing unpaced", exc)
             self._peripheral = None
 
 
@@ -70,16 +74,21 @@ def _peripheral_of(device: BLEDevice) -> Any:
 
 class BleLink:
     def __init__(self, device: BLEDevice, connect_timeout: float = 20.0) -> None:
-        self.name = device.name or device.address
+        # The advertised name is chosen by the device: never log it unescaped.
+        self.name = printable(device.name or device.address)
         self.address = device.address
+        # Names need not be unique, so the address goes with it until the device ID is known.
+        self.label = self.name if self.name == device.address else f"{self.name} {device.address}"
         self.disconnected = asyncio.Event()
-        self._gate = WriteGate(_peripheral_of(device))
+        self._log = DeviceLogger(log, lambda: self.label)
+        self._gate = WriteGate(_peripheral_of(device), lambda: self.label)
         self._client = BleakClient(
             device, disconnected_callback=self._on_disconnected, timeout=connect_timeout
         )
 
     def _on_disconnected(self, _client: BleakClient) -> None:
-        log.info("[%s] BLE disconnected", self.name)
+        # The session logs the end of the session, with its outcome.
+        self._log.debug("BLE disconnected")
         self.disconnected.set()
 
     async def connect(self) -> None:

@@ -17,6 +17,7 @@ from . import cloud, protocol
 from .artifacts import ArtifactCache, ArtifactServer
 from .ble import DeviceLink
 from .downlink import DownlinkChannel
+from .logs import DeviceLogger, Throttle, debug_traceback, describe, duration, printable
 from .protocol import Control, Message, MessageType, Rejected
 
 log = logging.getLogger(__name__)
@@ -80,6 +81,10 @@ class DeviceSession:
         self.capabilities: protocol.Capabilities | None = None
         self.forwarded = 0
         self.dropped = 0  # messages lost to a full buffer
+        self.rejected = 0  # messages from the device that could not be reassembled
+        self.started: float | None = None  # when the device was set up (time.monotonic())
+        self._log = DeviceLogger(log, lambda: self.label)
+        self._reject_throttle = Throttle()
         self.frame_size = protocol.DEFAULT_FRAME_SIZE
         self._artifact_cache = artifacts
         self._reassembler = protocol.Reassembler()
@@ -97,7 +102,8 @@ class DeviceSession:
 
     @property
     def label(self) -> str:
-        return self.device_id or self.link.name
+        """How log messages name the device: its BLE name and address, then its device ID."""
+        return self.link.label
 
     @property
     def ota_enabled(self) -> bool:
@@ -121,10 +127,27 @@ class DeviceSession:
             await self.link.disconnect()
             discarded = self._discard_buffered()
             if discarded:
-                log.warning("[%s] %d buffered messages discarded: the session ended before "
-                            "they could be sent to the cloud", self.label, discarded)
-            log.info("[%s] Session ended (%d messages forwarded%s)", self.label, self.forwarded,
-                     f", {self.dropped} dropped" if self.dropped else "")
+                self._log.warning("%d buffered messages discarded: the session ended before "
+                                  "they could be sent to the cloud", discarded)
+            # The gateway logs the end of the session, with its outcome and summary().
+
+    def summary(self) -> str:
+        """How long the session ran and what it forwarded, e.g. "after 2h 03m (1520 messages
+        to the cloud, 3 to the device)"; empty if the device was never set up."""
+        if self.started is None:
+            return ""
+        parts = [f"{self.forwarded} messages to the cloud"]
+        if self.dropped:
+            parts.append(f"{self.dropped} dropped")
+        # Artifact responses are firmware blocks; their transfers are logged on their own.
+        downlinks = [c for t, c in self._downlinks.items() if t != MessageType.ARTIFACT_RESPONSE]
+        parts.append(f"{sum(c.delivered for c in downlinks)} to the device")
+        failed = sum(c.failed for c in downlinks)
+        if failed:
+            parts.append(f"{failed} undelivered")
+        if self.rejected:
+            parts.append(f"{self.rejected} malformed from the device")
+        return f"after {duration(time.monotonic() - self.started)} ({', '.join(parts)})"
 
     def _discard_buffered(self) -> int:
         """Drop messages not yet published; the buffer does not outlive the BLE session."""
@@ -146,11 +169,13 @@ class DeviceSession:
         device_id = raw_id.decode("utf-8", errors="replace").rstrip("\x00").strip()
         if not device_id:
             raise SessionError("device reported an empty device ID")
-        self.device_id = device_id
+        self.device_id = device_id  # used as is towards the cloud, but logged escaped
+        ble_label, self.link.label = self.link.label, printable(device_id)
+        self.started = time.monotonic()
 
         cache = self._artifact_cache if caps.supports_ota else None
-        log.info("[%s] Connected to %s, protocol %s%s", device_id, self.link.name, caps,
-                 "" if cache or not caps.supports_ota else " (OTA disabled: no artifact cache)")
+        self._log.info("Connected to %s, protocol %s%s", ble_label, caps,
+                       "" if cache or not caps.supports_ota else " (OTA disabled: no artifact cache)")
 
         for route in C2D_ROUTES:
             if route.ota and cache is None:
@@ -158,7 +183,7 @@ class DeviceSession:
             # OTA commands always require an ACK; configuration does from protocol 1.1.
             channel = DownlinkChannel(
                 self.link, route.message_type, needs_ack=route.ota or caps.supports_acks,
-                label=device_id, max_attempts=route.max_attempts,
+                label=self.label, max_attempts=route.max_attempts,
             )
             if route.ota:
                 channel.on_undelivered = self._on_undelivered
@@ -168,10 +193,10 @@ class DeviceSession:
 
         if cache is not None:
             responses = DownlinkChannel(
-                self.link, MessageType.ARTIFACT_RESPONSE, needs_ack=False, label=device_id
+                self.link, MessageType.ARTIFACT_RESPONSE, needs_ack=False, label=self.label, quiet=True
             )
             self._downlinks[MessageType.ARTIFACT_RESPONSE] = responses
-            self._artifact_server = ArtifactServer(cache, responses.send, device_id)
+            self._artifact_server = ArtifactServer(cache, responses.send, self.label)
             self._start_task(self._artifact_server.run())
         return device_id
 
@@ -183,7 +208,7 @@ class DeviceSession:
             try:
                 await connection.connect()
                 connected_at = time.monotonic()
-                log.info("[%s] MQTT connected to %s", self.label, self.settings.host)
+                self._log.info("MQTT connected to %s", self.settings.host)
                 # Session metadata must precede telemetry on every MQTT session.
                 metadata = await self.link.read(protocol.SESSION_METADATA_UUID)
                 await connection.publish(cloud.TOPIC_INGEST_CBOR, metadata, qos=0)
@@ -200,7 +225,9 @@ class DeviceSession:
             except cloud.CloudError as exc:
                 if connected_at is not None and time.monotonic() - connected_at >= STABLE_CONNECTION_S:
                     backoff = MIN_BACKOFF_S
-                log.warning("[%s] MQTT error: %s (retrying in %.0fs)", self.label, exc, backoff)
+                # Refused credentials are a configuration error, not a passing network problem.
+                level = logging.ERROR if isinstance(exc, cloud.CloudAuthError) else logging.WARNING
+                self._log.log(level, "MQTT error: %s (retrying in %.0fs)", exc, backoff)
             finally:
                 await connection.close()
             with contextlib.suppress(TimeoutError):
@@ -232,7 +259,7 @@ class DeviceSession:
             await connection.publish(topic, payload, qos)
             self._pending = None
             self.forwarded += 1
-            log.debug("[%s] -> %s (%d bytes)", self.label, topic, len(payload))
+            self._log.debug("-> %s (%d bytes)", topic, len(payload))
 
     async def _watch_disconnect(self) -> None:
         await self.link.disconnected.wait()
@@ -245,30 +272,42 @@ class DeviceSession:
             now = time.monotonic()
             if now >= self._next_drop_report:
                 self._next_drop_report = now + DROP_REPORT_INTERVAL_S
-                log.warning("[%s] Buffer for the cloud is full, dropping the oldest messages "
-                            "(%d dropped so far)", self.label, self.dropped)
+                self._log.warning("Buffer for the cloud is full, dropping the oldest messages "
+                                  "(%d dropped so far)", self.dropped)
         self._queue.put_nowait(item)
 
     def _on_frame(self, frame: bytes) -> None:
         self._adapt_frame_size(len(frame))
-        if frame and not self._accepts(frame[0]):
+        if len(frame) < protocol.CONT_HEADER_LEN:
+            self._log.debug("Ignoring too-short frame (%d bytes)", len(frame))
+            return
+        if not self._accepts(frame[0]):
             # Per the protocol, unsupported types get no ACK/NACK; they are not
             # reassembled either.
-            log.debug("[%s] Ignoring frame of unsupported type 0x%02x", self.label, frame[0])
+            self._log.debug("Ignoring frame of unsupported type 0x%02x", frame[0])
             return
         result = self._reassembler.feed(frame)
         if isinstance(result, Message):
             self._on_device_message(result)
             if result.needs_ack:
                 self._send_control(True, result.message_type, result.sequence)
-        elif isinstance(result, Rejected) and result.needs_ack:
-            self._send_control(False, result.message_type, result.sequence)
+        elif isinstance(result, Rejected):
+            self._on_rejected(result)
         elif isinstance(result, Control):
-            log.debug("[%s] Received %s for type 0x%02x seq=%d", self.label,
-                      "ACK" if result.accepted else "NACK", result.message_type, result.sequence)
+            self._log.debug("Received %s for type 0x%02x seq=%d",
+                            "ACK" if result.accepted else "NACK", result.message_type, result.sequence)
             channel = self._downlinks.get(result.message_type)
             if channel is not None:
                 channel.on_control(result)
+
+    def _on_rejected(self, rejected: Rejected) -> None:
+        self.rejected += 1
+        # The device decides how often this happens, so the warning is rate-limited.
+        if self._reject_throttle.allow():
+            self._log.warning("Dropping %s seq=%d: %s%s", protocol.type_name(rejected.message_type),
+                              rejected.sequence, rejected.reason, self._reject_throttle.suppressed_note())
+        if rejected.needs_ack:
+            self._send_control(False, rejected.message_type, rejected.sequence)
 
     def _accepts(self, message_type: int) -> bool:
         """Whether the gateway handles frames of this type coming from the device."""
@@ -289,7 +328,7 @@ class DeviceSession:
         # at least as large as it sends, so frames it sent are safe to send back.
         size = min(received, protocol.MAX_FRAME_SIZE)
         if size > self.frame_size:
-            log.debug("[%s] Using %d-byte frames towards the device", self.label, size)
+            self._log.debug("Using %d-byte frames towards the device", size)
             self.frame_size = size
             for channel in self._downlinks.values():
                 channel.frame_size = size
@@ -298,12 +337,12 @@ class DeviceSession:
         route = self._routes.get(topic.split("/", 1)[0])
         channel = self._downlinks.get(route.message_type) if route else None
         if channel is None:
-            log.debug("[%s] Ignoring message on %s", self.label, topic)
+            self._log.debug("Ignoring message on %s", topic)
             return
         if not payload:
-            log.warning("[%s] Ignoring empty message on %s", self.label, topic)
+            self._log.warning("Ignoring empty message on %s", topic)
             return
-        log.debug("[%s] <- %s (%d bytes)", self.label, topic, len(payload))
+        self._log.debug("<- %s (%d bytes)", topic, len(payload))
         channel.submit(payload)
 
     def _on_undelivered(self) -> None:
@@ -326,8 +365,9 @@ class DeviceSession:
         try:
             await self.link.write(protocol.encode_control(accepted, message_type, sequence))
         except Exception as exc:  # BLE write failure; the device resends what was not ACKed
-            log.warning("[%s] Failed to write %s for type 0x%02x seq=%d: %s", self.label,
-                        "ACK" if accepted else "NACK", message_type, sequence, exc)
+            self._log.warning("Failed to write %s for type 0x%02x seq=%d: %s",
+                              "ACK" if accepted else "NACK", message_type, sequence, describe(exc),
+                              exc_info=debug_traceback(self._log))
 
     def _start_task(self, coro: Coroutine[object, object, None]) -> None:
         task = asyncio.create_task(coro)

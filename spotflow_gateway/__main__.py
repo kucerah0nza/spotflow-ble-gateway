@@ -49,8 +49,37 @@ async def _run(gateway: Gateway) -> None:
     await gateway.run()
 
 
+# Syslog priorities, which journald reads from a "<N>" prefix (for journalctl -p).
+_SYSLOG_PRIORITY = {logging.DEBUG: 7, logging.INFO: 6, logging.WARNING: 4, logging.ERROR: 3, logging.CRITICAL: 2}
+
+
+class _Formatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        record.module_name = record.name.removeprefix("spotflow_gateway.")
+        record.priority = _SYSLOG_PRIORITY.get(record.levelno, 6)
+        return super().format(record)
+
+
+def _stderr_is_journal() -> bool:
+    """Whether stderr goes to the systemd journal, which timestamps every line itself."""
+    try:
+        device, inode = (int(n) for n in os.environ.get("JOURNAL_STREAM", "").split(":"))
+        stat = os.fstat(sys.stderr.fileno())
+    except (ValueError, OSError, AttributeError):  # not set, malformed, or no real stderr
+        return False
+    return (stat.st_dev, stat.st_ino) == (device, inode)
+
+
+def log_format(verbose: bool, journal: bool) -> str:
+    prefix = "<%(priority)d>" if journal else "%(asctime)s "
+    # With -v, also which module logged it.
+    return prefix + "%(levelname)-7s " + ("%(module_name)-9s " if verbose else "") + "%(message)s"
+
+
 def configure_logging(verbose: bool) -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-7s %(message)s")
+    handler = logging.StreamHandler()
+    handler.setFormatter(_Formatter(log_format(verbose, _stderr_is_journal())))
+    logging.basicConfig(level=logging.INFO, handlers=[handler])
     # Verbose means the gateway's own debug messages only. The libraries stay at their
     # normal levels: at DEBUG, bleak logs the bytes of every BLE read, write and
     # notification, and those include firmware download links and their secrets.
@@ -69,7 +98,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         asyncio.run(_run(Gateway(settings, args.name)))
     except (KeyboardInterrupt, asyncio.CancelledError):
-        logging.info("Stopped")
+        logging.getLogger("spotflow_gateway").info("Stopped")
     return 0
 
 

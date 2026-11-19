@@ -7,13 +7,10 @@ https://docs.spotflow.io/fundamentals/bluetooth-low-energy.
 
 from __future__ import annotations
 
-import logging
 import struct
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import IntEnum, IntFlag
-
-log = logging.getLogger(__name__)
 
 _UUID_SUFFIX = "-81e5-4861-82ae-2c92e6887922"
 SERVICE_UUID = "26530001" + _UUID_SUFFIX
@@ -157,6 +154,7 @@ class Rejected:
     message_type: int
     sequence: int
     needs_ack: bool
+    reason: str = field(default="", compare=False)
 
 
 class _Channel:
@@ -185,7 +183,6 @@ class Reassembler:
         was ignored.
         """
         if len(frame) < CONT_HEADER_LEN:
-            log.debug("Ignoring too-short frame (%d bytes)", len(frame))
             return None
 
         message_type, flags, sequence = frame[0], frame[1], frame[2]
@@ -199,8 +196,8 @@ class Reassembler:
         ch = self._channels.setdefault(message_type, _Channel())
 
         def reject(reason: str) -> Rejected:
-            log.warning("Dropping %s seq=%d: %s", _type_name(message_type), sequence, reason)
-            rejected = Rejected(message_type, sequence, needs_ack or (ch.active and ch.needs_ack))
+            # Not logged here: the session logs it, with the device it came from.
+            rejected = Rejected(message_type, sequence, needs_ack or (ch.active and ch.needs_ack), reason)
             ch.active = False
             return rejected
 
@@ -237,7 +234,7 @@ class Reassembler:
         return Message(message_type, sequence, bytes(ch.buffer), needs_ack)
 
 
-def _type_name(message_type: int) -> str:
+def type_name(message_type: int) -> str:
     try:
         return MessageType(message_type).name
     except ValueError:
