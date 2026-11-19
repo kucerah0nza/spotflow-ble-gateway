@@ -116,7 +116,7 @@ delay of up to one minute. Stop the gateway with Ctrl+C (or `SIGTERM` on Linux a
 disconnects all devices before exiting. Example output:
 
 ```
-2026-11-18 10:15:02,101 INFO    Spotflow BLE gateway 0.1.0 (Python 3.13.7, bleak 1.1.1, paho-mqtt 2.1.0, Linux-6.8.0-aarch64)
+2026-11-18 10:15:02,101 INFO    Spotflow BLE gateway 0.1.0 (Python 3.13.7, bleak 3.1.0, paho-mqtt 2.2.0, Linux-6.8.0-aarch64)
 2026-11-18 10:15:02,114 INFO    Scanning for Spotflow BLE devices (MQTT broker mqtt.spotflow.io:8883)
 2026-11-18 10:15:07,530 INFO    [Spotflow BLE device C4:3F:2A:91:0B:7E] Connecting (RSSI -58)
 2026-11-18 10:15:08,912 INFO    [sensor-042] Connected to Spotflow BLE device C4:3F:2A:91:0B:7E, protocol v1.1 ota=yes
@@ -126,7 +126,8 @@ disconnects all devices before exiting. Example output:
 
 Each line about a device starts with the device ID in brackets or, until the device has reported
 its ID, its advertised name and address. If the gateway finds no device, it logs
-`No Spotflow devices in range, still scanning` (at most every 10 minutes).
+`No Spotflow devices in range, still scanning` (with `--name`: `No Spotflow devices with a
+matching name in range`), at most every 10 minutes.
 
 ### Options
 
@@ -152,7 +153,8 @@ systemd:
    add the user to it:
 
    ```sh
-   sudo useradd --system --no-create-home --groups bluetooth spotflow-gateway
+   sudo useradd --system --no-create-home spotflow-gateway
+   getent group bluetooth && sudo usermod -aG bluetooth spotflow-gateway
    ```
 
 3. Store the ingest key in a file that only root can read:
@@ -260,11 +262,11 @@ every device supports, and switches to larger writes once the device has shown i
 
 | Symptom | What to check |
 |---|---|
-| No devices found (`No Spotflow devices in range`) | If the log says `Ignoring Spotflow device ...: its name does not match --name`, adjust `--name`. Otherwise, check that the device is powered, advertising and in range, and not connected to another gateway or app. On macOS, allow Bluetooth access for the terminal or app running the gateway (System Settings → Privacy & Security → Bluetooth). On Linux, check that `bluetoothd` is running and the adapter is on (`bluetoothctl show`). |
+| No devices found (`No Spotflow devices ... in range`) | If the log says `Ignoring Spotflow device ...: its name does not match --name`, adjust `--name`. Otherwise, check that the device is powered, advertising and in range, and not connected to another gateway or app. On macOS, allow Bluetooth access for the terminal or app running the gateway (System Settings → Privacy & Security → Bluetooth). On Linux, check that `bluetoothd` is running and the adapter is on (`bluetoothctl show`). |
 | `MQTT error: connection refused: Bad user name or password` | The ingest key is wrong or has been revoked. |
 | `MQTT error: cannot connect to mqtt.spotflow.io` | Network access to `mqtt.spotflow.io` on TCP port 8883 (firewall, proxy, DNS). |
 | `unsupported protocol version` | The device firmware uses a newer protocol version than this gateway. Update the gateway. |
-| BLE errors right after connecting | The device requires encryption. Pair it with the gateway host (see [Security](#security)). The gateway retries with an increasing delay, so it can take up to a minute to connect after pairing. |
+| BLE errors right after connecting (`Failed to connect: ...` or `Session failed: BLE error: ...`) | The device may require encryption. Pair it with the gateway host (see [Security](#security)). The gateway retries with an increasing delay, so it can take up to a minute to connect after pairing. |
 | `an OTA command could not be delivered to the device` | The device did not acknowledge an update command. The gateway disconnects it and tries again after reconnecting. If it keeps happening, check that the device is in range and look at the device's own log. |
 | `Buffer for the cloud is full, dropping the oldest messages` | The gateway cannot reach Spotflow, or the device sends data faster than the connection can forward it. Check the preceding `MQTT error` messages. |
 | `Artifact OPEN failed: ... is not a public address` | The firmware download location resolves to a private or local address, which the gateway refuses (see [Security](#security)). |
@@ -298,6 +300,7 @@ CI runs the full test suite on Linux, macOS and Windows.
 | `cloud.py` | MQTT connection to Spotflow (based on [paho-mqtt](https://github.com/eclipse-paho/paho.mqtt.python)) |
 | `downlink.py` | Ordered, acknowledged delivery of messages to the device |
 | `artifacts.py` | Firmware download and block transfer for OTA |
+| `logs.py` | Logging helpers: device labels, escaping, rate limiting |
 
 ## License
 
