@@ -1,0 +1,335 @@
+"""Bridge between one BLE device and its MQTT connection to the Spotflow cloud.
+
+Payloads are forwarded unchanged; the gateway never decodes telemetry, configuration
+or OTA messages. The only protocol it terminates is the artifact (firmware) transfer.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import logging
+import time
+from collections.abc import Coroutine
+from dataclasses import dataclass
+
+from . import cloud, protocol
+from .artifacts import ArtifactCache, ArtifactServer
+from .ble import DeviceLink
+from .downlink import DownlinkChannel
+from .protocol import Control, Message, MessageType, Rejected
+
+log = logging.getLogger(__name__)
+
+# Device -> cloud routing of reassembled BLE messages: type -> (topic, publish QoS).
+# Telemetry and configuration use QoS 0, like the Device SDK. OTA results use QoS 1
+# (the cloud accepts 0 or 1 there), so that a result is not lost with a connection that
+# is just breaking: the cloud repeats an update command until it has the results.
+D2C_TOPICS: dict[int, tuple[str, int]] = {
+    MessageType.TELEMETRY: (cloud.TOPIC_INGEST_CBOR, 0),
+    MessageType.REPORTED_CONFIGURATION: (cloud.TOPIC_CONFIG_D2C, 0),
+    MessageType.OTA_D2C: (cloud.TOPIC_OTA_D2C, 1),
+}
+
+
+@dataclass(frozen=True)
+class C2DRoute:
+    topic: str
+    message_type: MessageType
+    qos: int
+    ota: bool  # only for devices that advertise OTA support
+    max_attempts: int
+
+
+# Cloud -> device routing. The broker may deliver on a device-specific subtopic,
+# e.g. ota-cbor-c2d/<workspace>/<device>, so routing uses the first topic level.
+C2D_ROUTES = [
+    C2DRoute(cloud.TOPIC_CONFIG_C2D, MessageType.DESIRED_CONFIGURATION, qos=0, ota=False, max_attempts=5),
+    C2DRoute(cloud.TOPIC_OTA_C2D, MessageType.OTA_C2D, qos=1, ota=True, max_attempts=10),
+]
+
+QUEUE_SIZE = 1000
+# While the buffer overflows, say so at most this often (not once per dropped message).
+DROP_REPORT_INTERVAL_S = 60.0
+# Delay before reconnecting to the cloud: doubles after every failure and starts over
+# only once a connection has lasted STABLE_CONNECTION_S. A connection that is accepted
+# and then dropped right away (a refused subscription, another session using the same
+# device ID) therefore backs off like one that cannot be established at all.
+MIN_BACKOFF_S = 1.0
+MAX_BACKOFF_S = 60.0
+STABLE_CONNECTION_S = 30.0
+
+# A message waiting to be published: (topic, payload, QoS).
+Outgoing = tuple[str, bytes, int]
+
+
+class SessionError(Exception):
+    pass
+
+
+class DeviceSession:
+    def __init__(
+        self,
+        link: DeviceLink,
+        settings: cloud.CloudSettings,
+        artifacts: ArtifactCache | None = None,
+    ) -> None:
+        self.link = link
+        self.settings = settings
+        self.device_id: str | None = None
+        self.capabilities: protocol.Capabilities | None = None
+        self.forwarded = 0
+        self.dropped = 0  # messages lost to a full buffer
+        self.frame_size = protocol.DEFAULT_FRAME_SIZE
+        self._artifact_cache = artifacts
+        self._reassembler = protocol.Reassembler()
+        # None marks the end of the queue: the BLE device has disconnected.
+        self._queue: asyncio.Queue[Outgoing | None] = asyncio.Queue(QUEUE_SIZE)
+        self._pending: Outgoing | None = None
+        self._next_drop_report = 0.0
+        self._notifying = False
+        # Why the session has to be restarted, if it does (see _on_undelivered).
+        self._failure: str | None = None
+        self._tasks: set[asyncio.Task[None]] = set()
+        self._routes: dict[str, C2DRoute] = {}
+        self._downlinks: dict[int, DownlinkChannel] = {}
+        self._artifact_server: ArtifactServer | None = None
+
+    @property
+    def label(self) -> str:
+        return self.device_id or self.link.name
+
+    @property
+    def ota_enabled(self) -> bool:
+        return self._artifact_server is not None
+
+    async def run(self) -> None:
+        """Run until the BLE device disconnects (or the task is cancelled).
+
+        Raises SessionError if the device cannot be served; the caller is expected to
+        connect to it again later.
+        """
+        watcher = asyncio.create_task(self._watch_disconnect())
+        try:
+            await self._cloud_loop(await self._discover())
+            if self._failure is not None:
+                raise SessionError(self._failure)
+        finally:
+            watcher.cancel()
+            for task in self._tasks:
+                task.cancel()
+            await self.link.disconnect()
+            discarded = self._discard_buffered()
+            if discarded:
+                log.warning("[%s] %d buffered messages discarded: the session ended before "
+                            "they could be sent to the cloud", self.label, discarded)
+            log.info("[%s] Session ended (%d messages forwarded%s)", self.label, self.forwarded,
+                     f", {self.dropped} dropped" if self.dropped else "")
+
+    def _discard_buffered(self) -> int:
+        """Drop messages not yet published; the buffer does not outlive the BLE session."""
+        count = 0 if self._pending is None else 1
+        self._pending = None
+        while not self._queue.empty():
+            if self._queue.get_nowait() is not None:
+                count += 1
+        return count
+
+    async def _discover(self) -> str:
+        """Read the device's identity, set up its downlink channels, return its device ID."""
+        caps = protocol.Capabilities.parse(await self.link.read(protocol.CAPABILITIES_UUID))
+        self.capabilities = caps
+        if not caps.is_supported:
+            raise SessionError(f"unsupported protocol version {caps}")
+
+        raw_id = await self.link.read(protocol.DEVICE_ID_UUID)
+        device_id = raw_id.decode("utf-8", errors="replace").rstrip("\x00").strip()
+        if not device_id:
+            raise SessionError("device reported an empty device ID")
+        self.device_id = device_id
+
+        cache = self._artifact_cache if caps.supports_ota else None
+        log.info("[%s] Connected to %s, protocol %s%s", device_id, self.link.name, caps,
+                 "" if cache or not caps.supports_ota else " (OTA disabled: no artifact cache)")
+
+        for route in C2D_ROUTES:
+            if route.ota and cache is None:
+                continue
+            # OTA commands always require an ACK; configuration does from protocol 1.1.
+            channel = DownlinkChannel(
+                self.link, route.message_type, needs_ack=route.ota or caps.supports_acks,
+                label=device_id, max_attempts=route.max_attempts,
+            )
+            if route.ota:
+                channel.on_undelivered = self._on_undelivered
+            self._routes[route.topic] = route
+            self._downlinks[route.message_type] = channel
+            self._start_task(channel.run())
+
+        if cache is not None:
+            responses = DownlinkChannel(
+                self.link, MessageType.ARTIFACT_RESPONSE, needs_ack=False, label=device_id
+            )
+            self._downlinks[MessageType.ARTIFACT_RESPONSE] = responses
+            self._artifact_server = ArtifactServer(cache, responses.send, device_id)
+            self._start_task(self._artifact_server.run())
+        return device_id
+
+    async def _cloud_loop(self, device_id: str) -> None:
+        backoff = MIN_BACKOFF_S
+        while not self.link.disconnected.is_set():
+            connection = cloud.CloudConnection(self.settings, device_id, self._on_cloud_message)
+            connected_at: float | None = None
+            try:
+                await connection.connect()
+                connected_at = time.monotonic()
+                log.info("[%s] MQTT connected to %s", self.label, self.settings.host)
+                # Session metadata must precede telemetry on every MQTT session.
+                metadata = await self.link.read(protocol.SESSION_METADATA_UUID)
+                await connection.publish(cloud.TOPIC_INGEST_CBOR, metadata, qos=0)
+                # Subscribe before enabling notifications: the device reports its
+                # configuration right away, and the cloud sends pending OTA commands
+                # as soon as the subscription exists.
+                for route in self._routes.values():
+                    await connection.subscribe(route.topic, qos=route.qos)
+                if not self._notifying:
+                    await self.link.start_notify(self._on_frame)
+                    self._notifying = True
+                await self._serve(connection)
+                return
+            except cloud.CloudError as exc:
+                if connected_at is not None and time.monotonic() - connected_at >= STABLE_CONNECTION_S:
+                    backoff = MIN_BACKOFF_S
+                log.warning("[%s] MQTT error: %s (retrying in %.0fs)", self.label, exc, backoff)
+            finally:
+                await connection.close()
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(self.link.disconnected.wait(), backoff)
+            backoff = min(backoff * 2, MAX_BACKOFF_S)
+
+    async def _serve(self, connection: cloud.CloudConnection) -> None:
+        """Forward device messages until BLE disconnects; raises CloudError if MQTT drops."""
+        forward = asyncio.create_task(self._forward(connection))
+        dropped = asyncio.create_task(connection.wait_disconnected())
+        try:
+            done, _ = await asyncio.wait({forward, dropped}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for task in (forward, dropped):
+                task.cancel()
+            await asyncio.gather(forward, dropped, return_exceptions=True)
+        if forward in done:
+            forward.result()  # BLE disconnected (returns) or a publish failed (raises)
+            return
+        raise cloud.CloudError(dropped.result())
+
+    async def _forward(self, connection: cloud.CloudConnection) -> None:
+        while True:
+            item = self._pending or await self._queue.get()
+            if item is None:
+                return
+            self._pending = item  # keep until published, so an MQTT drop does not lose it
+            topic, payload, qos = item
+            await connection.publish(topic, payload, qos)
+            self._pending = None
+            self.forwarded += 1
+            log.debug("[%s] -> %s (%d bytes)", self.label, topic, len(payload))
+
+    async def _watch_disconnect(self) -> None:
+        await self.link.disconnected.wait()
+        self._enqueue(None)
+
+    def _enqueue(self, item: Outgoing | None) -> None:
+        if self._queue.full():
+            self._queue.get_nowait()
+            self.dropped += 1
+            now = time.monotonic()
+            if now >= self._next_drop_report:
+                self._next_drop_report = now + DROP_REPORT_INTERVAL_S
+                log.warning("[%s] Buffer for the cloud is full, dropping the oldest messages "
+                            "(%d dropped so far)", self.label, self.dropped)
+        self._queue.put_nowait(item)
+
+    def _on_frame(self, frame: bytes) -> None:
+        self._adapt_frame_size(len(frame))
+        if frame and not self._accepts(frame[0]):
+            # Per the protocol, unsupported types get no ACK/NACK; they are not
+            # reassembled either.
+            log.debug("[%s] Ignoring frame of unsupported type 0x%02x", self.label, frame[0])
+            return
+        result = self._reassembler.feed(frame)
+        if isinstance(result, Message):
+            self._on_device_message(result)
+            if result.needs_ack:
+                self._send_control(True, result.message_type, result.sequence)
+        elif isinstance(result, Rejected) and result.needs_ack:
+            self._send_control(False, result.message_type, result.sequence)
+        elif isinstance(result, Control):
+            log.debug("[%s] Received %s for type 0x%02x seq=%d", self.label,
+                      "ACK" if result.accepted else "NACK", result.message_type, result.sequence)
+            channel = self._downlinks.get(result.message_type)
+            if channel is not None:
+                channel.on_control(result)
+
+    def _accepts(self, message_type: int) -> bool:
+        """Whether the gateway handles frames of this type coming from the device."""
+        if message_type == MessageType.ARTIFACT_REQUEST:
+            return self._artifact_server is not None
+        return message_type in D2C_TOPICS or message_type in (MessageType.ACK, MessageType.NACK)
+
+    def _on_device_message(self, message: Message) -> None:
+        if message.message_type == MessageType.ARTIFACT_REQUEST:
+            if self._artifact_server is not None:
+                self._artifact_server.submit(message.payload)
+            return
+        topic, qos = D2C_TOPICS[message.message_type]
+        self._enqueue((topic, message.payload, qos))
+
+    def _adapt_frame_size(self, received: int) -> None:
+        # The device sizes its frames to the negotiated ATT MTU and can receive frames
+        # at least as large as it sends, so frames it sent are safe to send back.
+        size = min(received, protocol.MAX_FRAME_SIZE)
+        if size > self.frame_size:
+            log.debug("[%s] Using %d-byte frames towards the device", self.label, size)
+            self.frame_size = size
+            for channel in self._downlinks.values():
+                channel.frame_size = size
+
+    def _on_cloud_message(self, topic: str, payload: bytes) -> None:
+        route = self._routes.get(topic.split("/", 1)[0])
+        channel = self._downlinks.get(route.message_type) if route else None
+        if channel is None:
+            log.debug("[%s] Ignoring message on %s", self.label, topic)
+            return
+        if not payload:
+            log.warning("[%s] Ignoring empty message on %s", self.label, topic)
+            return
+        log.debug("[%s] <- %s (%d bytes)", self.label, topic, len(payload))
+        channel.submit(payload)
+
+    def _on_undelivered(self) -> None:
+        """An OTA command could not be delivered to the device.
+
+        The broker has already been told that the gateway received the command, and the
+        cloud sends it again only when the gateway subscribes anew. So start over:
+        disconnecting makes run() end with an error, and the next session with the
+        device subscribes again.
+        """
+        if self.link.disconnected.is_set():
+            return  # the session is ending anyway
+        self._failure = "an OTA command could not be delivered to the device"
+        self._start_task(self.link.disconnect())
+
+    def _send_control(self, accepted: bool, message_type: int, sequence: int) -> None:
+        self._start_task(self._write_control(accepted, message_type, sequence))
+
+    async def _write_control(self, accepted: bool, message_type: int, sequence: int) -> None:
+        try:
+            await self.link.write(protocol.encode_control(accepted, message_type, sequence))
+        except Exception as exc:  # BLE write failure; the device resends what was not ACKed
+            log.warning("[%s] Failed to write %s for type 0x%02x seq=%d: %s", self.label,
+                        "ACK" if accepted else "NACK", message_type, sequence, exc)
+
+    def _start_task(self, coro: Coroutine[object, object, None]) -> None:
+        task = asyncio.create_task(coro)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
