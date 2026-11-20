@@ -13,12 +13,13 @@ import time
 from collections.abc import Coroutine
 from dataclasses import dataclass
 
-from . import cloud, protocol
+from . import cloud, config, protocol
 from .artifacts import ArtifactCache, ArtifactServer
 from .ble import DeviceLink
 from .downlink import DownlinkChannel
-from .logs import DeviceLogger, Throttle, debug_traceback, describe, duration, printable
+from .logs import DeviceLogger, Throttle, count, debug_traceback, describe, duration, printable
 from .protocol import Control, Message, MessageType, Rejected
+from .status import Counts
 
 log = logging.getLogger(__name__)
 
@@ -82,7 +83,12 @@ class DeviceSession:
         self.forwarded = 0
         self.dropped = 0  # messages lost to a full buffer
         self.rejected = 0  # messages from the device that could not be reassembled
+        self.discarded = 0  # buffered messages lost because the session ended
+        self.cloud_online = False  # whether the MQTT connection is up
         self.started: float | None = None  # when the device was set up (time.monotonic())
+        # The device's minimal log severity: as it last reported it, or as the cloud last
+        # set it. Only for the log; None until known.
+        self.log_severity: int | None = None
         self._log = DeviceLogger(log, lambda: self.label)
         self._reject_throttle = Throttle()
         self.frame_size = protocol.DEFAULT_FRAME_SIZE
@@ -91,7 +97,12 @@ class DeviceSession:
         # None marks the end of the queue: the BLE device has disconnected.
         self._queue: asyncio.Queue[Outgoing | None] = asyncio.Queue(QUEUE_SIZE)
         self._pending: Outgoing | None = None
+        # Messages buffered while the cloud was unreachable that are still to be sent
+        # after reconnecting, and how many there were (for the log).
+        self._backlog = 0
+        self._backlog_total = 0
         self._next_drop_report = 0.0
+        self._end_queued = False  # whether the end-of-queue marker (None) is in the queue
         self._notifying = False
         # Why the session has to be restarted, if it does (see _on_undelivered).
         self._failure: str | None = None
@@ -126,37 +137,54 @@ class DeviceSession:
                 task.cancel()
             await self.link.disconnect()
             discarded = self._discard_buffered()
+            self.discarded += discarded
             if discarded:
                 self._log.warning("%d buffered messages discarded: the session ended before "
                                   "they could be sent to the cloud", discarded)
             # The gateway logs the end of the session, with its outcome and summary().
+
+    def counts(self) -> Counts:
+        """What the session has forwarded so far (for the gateway's status line)."""
+        # Artifact responses are firmware blocks; their transfers are logged on their own.
+        downlinks = [c for t, c in self._downlinks.items() if t != MessageType.ARTIFACT_RESPONSE]
+        return Counts(
+            to_cloud=self.forwarded,
+            to_devices=sum(c.delivered for c in downlinks),
+            dropped=self.dropped,
+            discarded=self.discarded,
+            undelivered=sum(c.failed for c in downlinks),
+            malformed=self.rejected,
+        )
 
     def summary(self) -> str:
         """How long the session ran and what it forwarded, e.g. "after 2h 03m (1520 messages
         to the cloud, 3 to the device)"; empty if the device was never set up."""
         if self.started is None:
             return ""
-        parts = [f"{self.forwarded} messages to the cloud"]
-        if self.dropped:
-            parts.append(f"{self.dropped} dropped")
-        # Artifact responses are firmware blocks; their transfers are logged on their own.
-        downlinks = [c for t, c in self._downlinks.items() if t != MessageType.ARTIFACT_RESPONSE]
-        parts.append(f"{sum(c.delivered for c in downlinks)} to the device")
-        failed = sum(c.failed for c in downlinks)
-        if failed:
-            parts.append(f"{failed} undelivered")
-        if self.rejected:
-            parts.append(f"{self.rejected} malformed from the device")
+        counts = self.counts()
+        parts = [f"{counts.to_cloud} messages to the cloud"]
+        if counts.dropped:
+            parts.append(f"{counts.dropped} dropped")
+        parts.append(f"{counts.to_devices} to the device")
+        if counts.undelivered:
+            parts.append(f"{counts.undelivered} undelivered")
+        if counts.malformed:
+            parts.append(f"{counts.malformed} malformed from the device")
         return f"after {duration(time.monotonic() - self.started)} ({', '.join(parts)})"
+
+    def buffered(self) -> int:
+        """Messages waiting to be sent to the cloud."""
+        # The end-of-queue marker is not a message (and may already have been taken).
+        return max(0, (self._pending is not None) + self._queue.qsize() - self._end_queued)
 
     def _discard_buffered(self) -> int:
         """Drop messages not yet published; the buffer does not outlive the BLE session."""
-        count = 0 if self._pending is None else 1
+        discarded = 0 if self._pending is None else 1
         self._pending = None
         while not self._queue.empty():
             if self._queue.get_nowait() is not None:
-                count += 1
-        return count
+                discarded += 1
+        return discarded
 
     async def _discover(self) -> str:
         """Read the device's identity, set up its downlink channels, return its device ID."""
@@ -202,13 +230,16 @@ class DeviceSession:
 
     async def _cloud_loop(self, device_id: str) -> None:
         backoff = MIN_BACKOFF_S
+        offline_since: float | None = None  # when the cloud became unreachable
         while not self.link.disconnected.is_set():
             connection = cloud.CloudConnection(self.settings, device_id, self._on_cloud_message)
             connected_at: float | None = None
             try:
                 await connection.connect()
                 connected_at = time.monotonic()
-                self._log.info("MQTT connected to %s", self.settings.host)
+                self.cloud_online = True
+                self._log_connected(offline_since)
+                offline_since = None
                 # Session metadata must precede telemetry on every MQTT session.
                 metadata = await self.link.read(protocol.SESSION_METADATA_UUID)
                 await connection.publish(cloud.TOPIC_INGEST_CBOR, metadata, qos=0)
@@ -227,12 +258,31 @@ class DeviceSession:
                     backoff = MIN_BACKOFF_S
                 # Refused credentials are a configuration error, not a passing network problem.
                 level = logging.ERROR if isinstance(exc, cloud.CloudAuthError) else logging.WARNING
-                self._log.log(level, "MQTT error: %s (retrying in %.0fs)", exc, backoff)
+                # Device messages are buffered from the first connection on.
+                buffered = f", {count(self.buffered(), 'message')} buffered" if self._notifying else ""
+                self._log.log(level, "MQTT error: %s (retrying in %.0fs%s)", exc, backoff, buffered)
+                if offline_since is None:
+                    offline_since = time.monotonic()
             finally:
+                self.cloud_online = False
                 await connection.close()
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(self.link.disconnected.wait(), backoff)
             backoff = min(backoff * 2, MAX_BACKOFF_S)
+
+    def _log_connected(self, offline_since: float | None) -> None:
+        if offline_since is None or not self._notifying:  # not reconnecting: nothing buffered
+            self._log.info("MQTT connected to %s", self.settings.host)
+            return
+        # Messages that arrive from now on are sent right away; count only the backlog.
+        self._backlog = self._backlog_total = self.buffered()
+        offline = duration(time.monotonic() - offline_since)
+        if self._backlog:
+            self._log.info("MQTT connected to %s after %s offline, sending %s buffered meanwhile",
+                           self.settings.host, offline, count(self._backlog, "message"))
+        else:
+            self._log.info("MQTT connected to %s after %s offline, no messages were buffered",
+                           self.settings.host, offline)
 
     async def _serve(self, connection: cloud.CloudConnection) -> None:
         """Forward device messages until BLE disconnects; raises CloudError if MQTT drops."""
@@ -260,10 +310,16 @@ class DeviceSession:
             self._pending = None
             self.forwarded += 1
             self._log.debug("-> %s (%d bytes)", topic, len(payload))
+            if self._backlog:
+                self._backlog -= 1
+                if not self._backlog:
+                    self._log.info("All %s buffered while offline sent to the cloud",
+                                   count(self._backlog_total, "message"))
 
     async def _watch_disconnect(self) -> None:
         await self.link.disconnected.wait()
         self._enqueue(None)
+        self._end_queued = True
 
     def _enqueue(self, item: Outgoing | None) -> None:
         if self._queue.full():
@@ -320,8 +376,44 @@ class DeviceSession:
             if self._artifact_server is not None:
                 self._artifact_server.submit(message.payload)
             return
+        if message.message_type == MessageType.REPORTED_CONFIGURATION:
+            self._log_reported_config(message.payload)
         topic, qos = D2C_TOPICS[message.message_type]
         self._enqueue((topic, message.payload, qos))
+
+    def _log_reported_config(self, payload: bytes) -> None:
+        reported = config.parse_reported(payload)
+        if reported is None:
+            self._log.debug("Reported configuration not understood, forwarding it as is")
+            return
+        details = []
+        if reported.acked_version is not None:
+            details.append(f"configuration version {reported.acked_version} applied")
+        if reported.compiled_severity is not None:
+            details.append(f"compiled minimum {config.severity_name(reported.compiled_severity)}")
+        if reported.severity is None:
+            text = "Device reports its configuration"
+        else:
+            text = f"Device reports log severity {config.severity_name(reported.severity)}"
+            self.log_severity = reported.severity
+        self._log.info("%s%s", text, f" ({', '.join(details)})" if details else "")
+
+    def _describe_desired_config(self, payload: bytes) -> str:
+        """What a desired configuration changes, e.g. "log severity INFO -> WARNING
+        (configuration version 7)"; empty if the payload cannot be read."""
+        desired = config.parse_desired(payload)
+        if desired is None:
+            return ""
+        version = f"configuration version {desired.version}"
+        if desired.severity is None:
+            return f"{version}, log severity not set"
+        new = config.severity_name(desired.severity)
+        old, self.log_severity = self.log_severity, desired.severity
+        if old is None:
+            return f"log severity {new} ({version}; current severity not reported yet)"
+        if old == desired.severity:
+            return f"log severity {new}, unchanged ({version})"
+        return f"log severity {config.severity_name(old)} -> {new} ({version})"
 
     def _adapt_frame_size(self, received: int) -> None:
         # The device sizes its frames to the negotiated ATT MTU and can receive frames
@@ -343,7 +435,10 @@ class DeviceSession:
             self._log.warning("Ignoring empty message on %s", topic)
             return
         self._log.debug("<- %s (%d bytes)", topic, len(payload))
-        channel.submit(payload)
+        note = ""
+        if route is not None and route.message_type == MessageType.DESIRED_CONFIGURATION:
+            note = self._describe_desired_config(payload)
+        channel.submit(payload, note)
 
     def _on_undelivered(self) -> None:
         """An OTA command could not be delivered to the device.

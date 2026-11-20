@@ -23,6 +23,17 @@ def test_options_override_defaults(monkeypatch):
     assert args.name == ["A*", "B?"] and args.verbose
 
 
+def test_status_interval_in_minutes(monkeypatch, capsys):
+    monkeypatch.setenv("SPOTFLOW_INGEST_KEY", "k")
+    assert parse_args([]).status_interval == 5
+    assert parse_args(["--status-interval", "0"]).status_interval == 0
+    assert parse_args(["--status-interval", "0.5"]).status_interval == 0.5
+    for bad in ("-1", "nan"):
+        with pytest.raises(SystemExit):
+            parse_args(["--status-interval", bad])
+    assert "--status-interval must be 0 or more minutes" in capsys.readouterr().err
+
+
 def test_ingest_key_is_required(monkeypatch, capsys):
     monkeypatch.delenv("SPOTFLOW_INGEST_KEY", raising=False)
     with pytest.raises(SystemExit) as exit_info:

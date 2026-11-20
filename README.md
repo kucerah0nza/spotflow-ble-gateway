@@ -121,11 +121,23 @@ disconnects all devices before exiting. Example output:
 2026-11-18 10:15:07,530 INFO    [Spotflow BLE device C4:3F:2A:91:0B:7E] Connecting (RSSI -58)
 2026-11-18 10:15:08,912 INFO    [sensor-042] Connected to Spotflow BLE device C4:3F:2A:91:0B:7E, protocol v1.1 ota=yes
 2026-11-18 10:15:09,377 INFO    [sensor-042] MQTT connected to mqtt.spotflow.io
+2026-11-18 10:15:09,702 INFO    [sensor-042] Device reports log severity INFO (compiled minimum DEBUG)
+2026-11-18 10:42:30,118 INFO    [sensor-042] -> device DESIRED_CONFIGURATION (8 bytes), acknowledged: log severity INFO -> WARNING (configuration version 4)
+2026-11-18 10:42:30,305 INFO    [sensor-042] Device reports log severity WARNING (configuration version 4 applied, compiled minimum DEBUG)
+2026-11-18 11:05:02,114 INFO    Status: up 50m 00s, 1 device connected (sensor-042), all online; last 5 min: 68 messages to the cloud, 0 to devices; 0 buffered
+2026-11-18 11:07:12,560 WARNING [sensor-042] MQTT error: connection lost: Unspecified error (retrying in 1s, 0 messages buffered)
+2026-11-18 11:07:13,574 WARNING [sensor-042] MQTT error: cannot connect to mqtt.spotflow.io: [Errno -3] Temporary failure in name resolution (retrying in 2s, 1 message buffered)
+2026-11-18 11:09:16,021 INFO    [sensor-042] MQTT connected to mqtt.spotflow.io after 2m 03s offline, sending 27 messages buffered meanwhile
+2026-11-18 11:09:16,348 INFO    [sensor-042] All 27 messages buffered while offline sent to the cloud
 2026-11-18 12:18:41,006 INFO    [sensor-042] Session ended after 2h 03m (1520 messages to the cloud, 3 to the device): the device disconnected
 ```
 
 Each line about a device starts with the device ID in brackets or, until the device has reported
-its ID, its advertised name and address. If the gateway finds no device, it logs
+its ID, its advertised name and address. Every 5 minutes (see `--status-interval`), the gateway
+logs a `Status:` line: how long it has been running, the connected devices and whether they are
+connected to Spotflow, how many messages it forwarded in that period and how many are buffered.
+Problems in that period (dropped, discarded, undelivered or malformed messages, failed sessions)
+appear only when there were some. If the gateway finds no device, it logs
 `No Spotflow devices in range, still scanning` (with `--name`: `No Spotflow devices with a
 matching name in range`), at most every 10 minutes.
 
@@ -135,6 +147,7 @@ matching name in range`), at most every 10 minutes.
 |---|---|
 | `--ingest-key KEY` | Spotflow ingest key. Defaults to the `SPOTFLOW_INGEST_KEY` environment variable. Prefer the environment variable: command-line arguments are visible to other users of the host. |
 | `--name PATTERN` | Connect only to devices whose advertised BLE name matches this pattern (`*` and `?` wildcards). Can be given several times. Example: `--name 'Spotflow*'`. |
+| `--status-interval MINUTES` | How often to log the `Status:` line (default: 5). `0` turns it off. |
 | `-v`, `--verbose` | Debug logging, including every forwarded message (its topic and size, never its content), which module logged each line, and tracebacks of unexpected errors. |
 
 ## Running as a service (Linux)
@@ -263,6 +276,7 @@ every device supports, and switches to larger writes once the device has shown i
 | Symptom | What to check |
 |---|---|
 | No devices found (`No Spotflow devices ... in range`) | If the log says `Ignoring Spotflow device ...: its name does not match --name`, adjust `--name`. Otherwise, check that the device is powered, advertising and in range, and not connected to another gateway or app. On macOS, allow Bluetooth access for the terminal or app running the gateway (System Settings → Privacy & Security → Bluetooth). On Linux, check that `bluetoothd` is running and the adapter is on (`bluetoothctl show`). |
+| `Bluetooth is turned off, waiting for Bluetooth to become available` (or `not allowed to use Bluetooth`) | Turn Bluetooth on, or allow the gateway to use it; the gateway resumes scanning within a few seconds. |
 | `MQTT error: connection refused: Bad user name or password` | The ingest key is wrong or has been revoked. |
 | `MQTT error: cannot connect to mqtt.spotflow.io` | Network access to `mqtt.spotflow.io` on TCP port 8883 (firewall, proxy, DNS). |
 | `unsupported protocol version` | The device firmware uses a newer protocol version than this gateway. Update the gateway. |
@@ -299,8 +313,10 @@ CI runs the full test suite on Linux, macOS and Windows.
 | `ble.py` | BLE connection (based on [bleak](https://github.com/hbldh/bleak)) |
 | `cloud.py` | MQTT connection to Spotflow (based on [paho-mqtt](https://github.com/eclipse-paho/paho.mqtt.python)) |
 | `downlink.py` | Ordered, acknowledged delivery of messages to the device |
+| `config.py` | Reading remote configuration messages for the log |
 | `artifacts.py` | Firmware download and block transfer for OTA |
 | `logs.py` | Logging helpers: device labels, escaping, rate limiting |
+| `status.py` | The periodic status line |
 
 ## License
 

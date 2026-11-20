@@ -5,9 +5,9 @@ import logging
 from types import SimpleNamespace
 
 import pytest
-from bleak.exc import BleakError
+from bleak.exc import BleakBluetoothNotAvailableError, BleakBluetoothNotAvailableReason, BleakError
 
-from spotflow_gateway import cloud, gateway, protocol
+from spotflow_gateway import cloud, gateway, protocol, status
 from spotflow_gateway.gateway import Gateway
 from spotflow_gateway.session import SessionError
 
@@ -29,6 +29,7 @@ class Radio:
         self.connected = []
         self.session_end = asyncio.Event()
         self.summary = ""
+        self.sessions = []
         radio = self
 
         async def discover(**kwargs):
@@ -53,7 +54,16 @@ class Radio:
 
         class Session:
             def __init__(self, link, settings, artifacts):
-                pass
+                self.label = link.label
+                self.cloud_online = True
+                self.forwarded = 0
+                radio.sessions.append(self)
+
+            def counts(self):
+                return status.Counts(to_cloud=self.forwarded)
+
+            def buffered(self):
+                return 0
 
             async def run(self):
                 if radio.session_error:
@@ -120,6 +130,43 @@ async def test_name_filter(radio):
 
 def messages(caplog, level=logging.INFO):
     return [r.getMessage() for r in caplog.records if r.levelno >= level]
+
+
+async def test_bluetooth_turned_off_is_logged_once_and_checked_often(radio, gw, monkeypatch, caplog):
+    caplog.set_level(logging.INFO)
+    radio.scan_error = BleakBluetoothNotAvailableError("Bluetooth device is turned off",
+                                                       BleakBluetoothNotAvailableReason.POWERED_OFF)
+    pauses = []
+
+    async def sleep(seconds):
+        pauses.append(seconds)
+        if len(pauses) == 4:
+            radio.scan_error = None  # Bluetooth is turned on again
+        if len(pauses) == 6:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(gateway.asyncio, "sleep", sleep)
+    with pytest.raises(asyncio.CancelledError):
+        await gw._scan_loop()
+    assert pauses == [5, 5, 5, 5, 2, 2]  # no backoff: scanning resumes soon after it is back
+    assert messages(caplog) == [
+        "Bluetooth is turned off, waiting for Bluetooth to become available",
+        "Bluetooth is available again, scanning",
+        "No Spotflow devices in range, still scanning",
+    ]
+
+
+def test_bluetooth_unavailable_reasons():
+    def unavailable(reason, message="msg"):
+        return gateway.bluetooth_unavailable(BleakBluetoothNotAvailableError(message, reason))
+
+    assert unavailable(BleakBluetoothNotAvailableReason.NO_BLUETOOTH) == "No Bluetooth adapter found"
+    assert unavailable(BleakBluetoothNotAvailableReason.DENIED_BY_USER).startswith(
+        "The gateway is not allowed to use Bluetooth (on macOS")
+    assert unavailable(BleakBluetoothNotAvailableReason.UNKNOWN, "radio busy") == \
+        "Bluetooth is not available (radio busy)"
+    assert gateway.bluetooth_unavailable(BleakError("adapter off")) is None  # an ordinary scan failure
+    assert gateway.bluetooth_unavailable(OSError("x")) is None
 
 
 @pytest.mark.parametrize(
@@ -281,3 +328,52 @@ async def test_devices_left_out_by_the_name_filter_are_reported_once(radio, monk
         "No Spotflow devices with a matching name in range, still scanning",
     ]
     assert radio.connected == []
+
+
+async def test_heartbeat_reports_what_happened_since_the_last_one(radio, caplog):
+    caplog.set_level(logging.INFO)
+    gw = Gateway(cloud.CloudSettings(ingest_key="k"), status_interval=300)
+    gw._started -= 3600
+    radio.found = dict([advertisement("AA"), advertisement("BB")])
+    await scan_and_connect(gw)
+    await asyncio.sleep(0)
+    first, second = radio.sessions
+    first.forwarded = 5
+    previous = gw.totals()
+
+    first.forwarded = 12
+    second.cloud_online = False
+    previous = gw._log_status(previous)
+    # Both sessions end meanwhile; their counts stay in the totals.
+    first.forwarded = 20
+    radio.session_end.set()
+    await asyncio.sleep(0.01)
+    gw._log_status(previous)
+
+    assert [m for m in messages(caplog) if m.startswith("Status")] == [
+        "Status: up 1h 00m, 2 devices connected (Spotflow device AA, Spotflow device BB), 1 offline from the cloud; "
+        "last 5 min: 7 messages to the cloud, 0 to devices; 0 buffered",
+        "Status: up 1h 00m, no devices connected; last 5 min: 8 messages to the cloud, 0 to devices; 0 buffered",
+    ]
+
+
+async def test_failed_sessions_are_counted(radio, gw):
+    radio.found = dict([advertisement("AA")])
+    radio.session_error = SessionError("unsupported protocol version")
+    await scan_and_connect(gw)
+    await asyncio.sleep(0.01)
+    assert gw.totals() == status.Counts(session_failures=1)
+
+
+async def test_heartbeat_runs_with_the_gateway(radio, monkeypatch, caplog):
+    caplog.set_level(logging.INFO)
+    gw = Gateway(cloud.CloudSettings(ingest_key="k"), status_interval=0.01)
+
+    async def scan_a_while():
+        await asyncio.sleep(0.05)
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(gw, "_scan_loop", scan_a_while)
+    with pytest.raises(asyncio.CancelledError):
+        await gw.run()
+    assert any(m.startswith("Status: up 0s, no devices connected; last 0s: 0 messages") for m in messages(caplog))

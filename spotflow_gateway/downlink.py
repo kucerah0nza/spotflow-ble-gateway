@@ -53,16 +53,21 @@ class DownlinkChannel:
         self.delivered = 0
         self.failed = 0
         self._sequence = 0
-        self._queue: asyncio.Queue[bytes] = asyncio.Queue(QUEUE_SIZE)
+        # (payload, note): the note says what the message does, for the log.
+        self._queue: asyncio.Queue[tuple[bytes, str]] = asyncio.Queue(QUEUE_SIZE)
         self._waiting: tuple[int, asyncio.Future[bool]] | None = None
         self._lock = asyncio.Lock()
 
-    def submit(self, payload: bytes) -> None:
-        """Queue a complete message for delivery (never blocks)."""
+    def submit(self, payload: bytes, note: str = "") -> None:
+        """Queue a complete message for delivery (never blocks).
+
+        ``note`` describes the message in the log lines about its delivery, e.g.
+        "log severity INFO -> WARNING (configuration version 7)".
+        """
         if self._queue.full():
             self._queue.get_nowait()
             self._log.warning("%s queue full, dropping oldest", self.message_type.name)
-        self._queue.put_nowait(payload)
+        self._queue.put_nowait((payload, note))
 
     def on_control(self, control: Control) -> None:
         """Feed an ACK/NACK received from the device."""
@@ -75,38 +80,38 @@ class DownlinkChannel:
     async def run(self) -> None:
         """Deliver messages queued with submit() until cancelled."""
         while True:
-            payload = await self._queue.get()
+            payload, note = await self._queue.get()
             try:
-                delivered = await self.send(payload)
+                delivered = await self.send(payload, note)
             except Exception as exc:  # BLE write failures; the session handles disconnects
-                self._log.warning("Failed to write %s: %s", self.message_type.name, describe(exc),
-                                  exc_info=debug_traceback(self._log))
+                self._log.warning("Failed to write %s: %s%s", self.message_type.name, describe(exc),
+                                  _suffix(note), exc_info=debug_traceback(self._log))
                 self.failed += 1
                 delivered = False
             if not delivered and self.on_undelivered is not None:
                 self.on_undelivered()
 
-    async def send(self, payload: bytes) -> bool:
+    async def send(self, payload: bytes, note: str = "") -> bool:
         """Deliver one message now (after any message already being sent); True on success."""
         async with self._lock:
             sequence = self._sequence
             self._sequence = (sequence + 1) & 0xFF
-            ok = await self._deliver(sequence, payload)
+            ok = await self._deliver(sequence, payload, _suffix(note))
         if ok:
             self.delivered += 1
         else:
             self.failed += 1
         return ok
 
-    async def _deliver(self, sequence: int, payload: bytes) -> bool:
+    async def _deliver(self, sequence: int, payload: bytes, note: str) -> bool:
         name = self.message_type.name
         frames = list(
             protocol.encode_frames(self.message_type, sequence, payload, self.frame_size, self.needs_ack)
         )
         if not self.needs_ack:
             await self._write(frames)
-            self._log.log(self._delivery_level, "-> device %s (%d bytes), sent without acknowledgement",
-                          name, len(payload))
+            self._log.log(self._delivery_level, "-> device %s (%d bytes), sent without acknowledgement%s",
+                          name, len(payload), note)
             return True
 
         loop = asyncio.get_running_loop()
@@ -118,8 +123,8 @@ class DownlinkChannel:
                 await self._write(frames)
                 with contextlib.suppress(TimeoutError):
                     if await asyncio.wait_for(future, self.ack_timeout):
-                        self._log.log(self._delivery_level, "-> device %s (%d bytes), acknowledged",
-                                      name, len(payload))
+                        self._log.log(self._delivery_level, "-> device %s (%d bytes), acknowledged%s",
+                                      name, len(payload), note)
                         return True
             finally:
                 self._waiting = None
@@ -131,10 +136,14 @@ class DownlinkChannel:
             self._log.info("%s seq=%d %s, retrying (attempt %d/%d)",
                            name, sequence, outcome, attempt, self.max_attempts)
             await asyncio.sleep(min(0.5 * 2 ** (attempt - 1), 8.0))
-        self._log.error("Giving up delivering %s seq=%d after %d attempts, the last one %s",
-                        name, sequence, self.max_attempts, outcome)
+        self._log.error("Giving up delivering %s seq=%d after %d attempts, the last one %s%s",
+                        name, sequence, self.max_attempts, outcome, note)
         return False
 
     async def _write(self, frames: list[bytes]) -> None:
         for frame in frames:
             await self.link.write(frame)
+
+
+def _suffix(note: str) -> str:
+    return f": {note}" if note else ""

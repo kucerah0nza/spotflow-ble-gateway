@@ -12,6 +12,7 @@ from spotflow_gateway import cloud, protocol
 from spotflow_gateway import session as session_module
 from spotflow_gateway.protocol import MessageType
 from spotflow_gateway.session import C2D_ROUTES, DeviceSession, SessionError
+from spotflow_gateway.status import Counts
 
 from .conftest import FakeLink, publish
 
@@ -32,6 +33,7 @@ async def test_forwards_session_metadata_then_telemetry(broker, recorder):
     link.send(MessageType.ARTIFACT_RESPONSE, b"never sent by a device, not routed")
 
     await recorder.wait_for(3)
+    assert session.cloud_online
     assert recorder.messages == [
         ("ingest-cbor", b"\xa1\x00\x01META"),
         ("ingest-cbor", b"log-1"),
@@ -42,11 +44,14 @@ async def test_forwards_session_metadata_then_telemetry(broker, recorder):
     link.disconnected.set()
     await asyncio.wait_for(task, 5)
     assert session.forwarded == 2
+    assert not session.cloud_online
+    assert session.counts() == Counts(to_cloud=2)
     assert link.label == "test-device"  # log messages name the device by its ID from now on
     assert re.fullmatch(r"after \ds \(2 messages to the cloud, 0 to the device\)", session.summary())
 
 
-async def test_mqtt_reconnect_republishes_metadata_and_keeps_messages(broker, recorder):
+async def test_mqtt_reconnect_republishes_metadata_and_keeps_messages(broker, recorder, caplog):
+    caplog.set_level(logging.INFO)
     link = FakeLink(metadata=b"META")
     task = asyncio.create_task(DeviceSession(link, settings_for(broker)).run())
     await asyncio.wait_for(link.notifying.wait(), 5)
@@ -70,6 +75,13 @@ async def test_mqtt_reconnect_republishes_metadata_and_keeps_messages(broker, re
 
     link.disconnected.set()
     await asyncio.wait_for(task, 5)
+    # The log says how many messages were buffered during the outage and that they were sent.
+    messages = [r.getMessage() for r in caplog.records]
+    retries = [m for m in messages if "MQTT error" in m]
+    assert retries and all(re.search(r"\(retrying in \d+s, \d+ messages? buffered\)$", m) for m in retries)
+    assert any(re.fullmatch(r"\[test-device\] MQTT connected to 127\.0\.0\.1 after \d+s offline, "
+                            r"sending 2 messages buffered meanwhile", m) for m in messages)
+    assert "[test-device] All 2 messages buffered while offline sent to the cloud" in messages
 
 
 async def test_unsupported_protocol_version(broker):
@@ -157,7 +169,7 @@ def test_device_specific_c2d_topic_is_routed():
     session = DeviceSession(FakeLink(), cloud.CloudSettings(ingest_key="k"))
     session._routes = {route.topic: route for route in C2D_ROUTES}
     channel = SimpleNamespace(items=[])
-    channel.submit = channel.items.append
+    channel.submit = lambda payload, note="": channel.items.append(payload)
     session._downlinks[MessageType.DESIRED_CONFIGURATION] = channel
     session._on_cloud_message("config-cbor-c2d/workspace/device", b"\x01")
     session._on_cloud_message("ota-cbor-c2d/workspace/device", b"\x02")
@@ -177,6 +189,8 @@ async def test_messages_buffered_during_outage_are_reported_when_device_disconne
     await asyncio.wait_for(task, 10)
     assert "2 buffered messages discarded" in caplog.text
     assert session.forwarded == 0
+    assert session.counts() == Counts(discarded=2)  # for the gateway's status line
+    assert session.buffered() == 0
 
 
 async def test_refused_ingest_key_is_logged_and_retried(mini_broker, caplog):
@@ -221,7 +235,7 @@ async def test_failed_acknowledgement_write_is_logged_not_raised(caplog):
 
 def retry_delays(caplog):
     """The delays announced by the session's "MQTT error ... (retrying in ...)" warnings."""
-    return [record.args[-1] for record in caplog.records if "MQTT error" in record.getMessage()]
+    return [record.args[1] for record in caplog.records if "MQTT error" in record.getMessage()]
 
 
 async def run_against_dropping_broker(mini_broker, caplog, failures):
@@ -363,3 +377,52 @@ async def test_failed_write_without_message_is_still_described(caplog):
     while session._tasks:
         await asyncio.sleep(0)
     assert "Failed to write ACK for type 0x05 seq=7: TimeoutError" in caplog.text
+
+
+DESIRED_WARNING_V2 = bytes([0xA3, 0x00, 0x03, 0x10, 0x18, 0x32, 0x12, 0x02])
+# What the Device SDK reports at startup: {0: 4, 0x10: 40 (INFO), 0x11: 30 (DEBUG)}.
+REPORTED_AT_STARTUP = bytes([0xA3, 0x00, 0x04, 0x10, 0x18, 0x28, 0x11, 0x18, 0x1E])
+
+
+def test_desired_configuration_is_described_with_the_former_severity():
+    session = DeviceSession(FakeLink(), cloud.CloudSettings(ingest_key="k"))
+    describe = session._describe_desired_config
+    assert describe(DESIRED_ERROR_V1) == (
+        "log severity ERROR (configuration version 1; current severity not reported yet)"
+    )
+    assert describe(DESIRED_WARNING_V2) == "log severity ERROR -> WARNING (configuration version 2)"
+    assert describe(DESIRED_WARNING_V2) == "log severity WARNING, unchanged (configuration version 2)"
+    assert describe(bytes([0xA2, 0x00, 0x03, 0x12, 0x03])) == "configuration version 3, log severity not set"
+    assert describe(b"not cbor") == ""
+
+
+def test_reported_configuration_is_logged(caplog):
+    caplog.set_level(logging.INFO)
+    session = DeviceSession(FakeLink(), cloud.CloudSettings(ingest_key="k"))
+    session._log_reported_config(REPORTED_AT_STARTUP)
+    assert session.log_severity == 40
+    # The former severity of the next desired configuration is the reported one.
+    assert session._describe_desired_config(DESIRED_ERROR_V1).startswith("log severity INFO -> ERROR")
+    session._log_reported_config(REPORTED_V1)
+    session._log_reported_config(b"\xff")  # not understood: forwarded, not logged at INFO
+    assert caplog.messages == [
+        "[fake-device AA:BB] Device reports log severity INFO (compiled minimum DEBUG)",
+        "[fake-device AA:BB] Device reports log severity INFO "
+        "(configuration version 1 applied, compiled minimum DEBUG)",
+    ]
+
+
+async def test_desired_configuration_delivery_names_the_change(broker, recorder, caplog):
+    caplog.set_level(logging.INFO)
+    link = FakeLink(capabilities=b"\x01")
+    task = asyncio.create_task(DeviceSession(link, settings_for(broker)).run())
+    await asyncio.wait_for(link.notifying.wait(), 5)
+    link.send(MessageType.REPORTED_CONFIGURATION, REPORTED_AT_STARTUP)
+    await recorder.wait_for(2)
+
+    await publish(broker, "config-cbor-c2d", DESIRED_ERROR_V1)
+    await link.wait_received(1)
+    link.disconnected.set()
+    await asyncio.wait_for(task, 5)
+    assert ("[test-device] -> device DESIRED_CONFIGURATION (8 bytes), sent without acknowledgement: "
+            "log severity INFO -> ERROR (configuration version 1)") in caplog.messages

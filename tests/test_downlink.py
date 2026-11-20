@@ -106,6 +106,16 @@ async def test_without_acks_sends_once(setup, caplog):
     ]
 
 
+async def test_note_describes_the_message_in_the_log(setup, caplog):
+    caplog.set_level(logging.INFO)
+    link, make = setup
+    channel = make(needs_ack=False)
+    channel.submit(b"cfg", "log severity INFO -> ERROR (configuration version 1)")
+    await wait_until(lambda: channel.delivered == 1)
+    assert caplog.messages == ["[fake-device AA:BB] -> device DESIRED_CONFIGURATION (3 bytes), sent without "
+                               "acknowledgement: log severity INFO -> ERROR (configuration version 1)"]
+
+
 async def test_quiet_channel_logs_deliveries_at_debug(setup, caplog):
     caplog.set_level(logging.DEBUG)
     link, make = setup

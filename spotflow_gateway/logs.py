@@ -35,6 +35,11 @@ def debug_traceback(logger: logging.Logger | logging.LoggerAdapter[Any]) -> bool
     return logger.isEnabledFor(logging.DEBUG)
 
 
+def count(n: int, noun: str) -> str:
+    """``n`` and the noun in singular or plural: "1 message", "3 messages"."""
+    return f"{n} {noun}" if n == 1 else f"{n} {noun}s"
+
+
 def duration(seconds: float) -> str:
     seconds = int(seconds)
     if seconds < 60:

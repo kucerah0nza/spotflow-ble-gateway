@@ -9,7 +9,7 @@ import os
 import signal
 import sys
 
-from . import cloud
+from . import cloud, status
 from .gateway import Gateway
 
 
@@ -33,10 +33,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--mqtt-host", default=cloud.DEFAULT_HOST, help=argparse.SUPPRESS)
     parser.add_argument("--mqtt-port", type=int, default=cloud.DEFAULT_PORT, help=argparse.SUPPRESS)
     parser.add_argument("--no-tls", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--status-interval",
+        type=float,
+        default=status.DEFAULT_INTERVAL_S / 60,
+        metavar="MINUTES",
+        help="log a status line this often (default: %(default)g; 0: never)",
+    )
     parser.add_argument("-v", "--verbose", action="store_true", help="debug logging")
     args = parser.parse_args(argv)
     if not args.ingest_key:
         parser.error("an ingest key is required (--ingest-key or SPOTFLOW_INGEST_KEY)")
+    if not args.status_interval >= 0:  # also rejects nan
+        parser.error("--status-interval must be 0 or more minutes")
     return args
 
 
@@ -96,7 +105,7 @@ def main(argv: list[str] | None = None) -> int:
         ingest_key=args.ingest_key, host=args.mqtt_host, port=args.mqtt_port, tls=not args.no_tls
     )
     try:
-        asyncio.run(_run(Gateway(settings, args.name)))
+        asyncio.run(_run(Gateway(settings, args.name, status_interval=args.status_interval * 60)))
     except (KeyboardInterrupt, asyncio.CancelledError):
         logging.getLogger("spotflow_gateway").info("Stopped")
     return 0
