@@ -328,3 +328,15 @@ class FakeLink:
         self._sequence[message_type] = (seq + 1) & 0xFF
         for frame in protocol.encode_frames(message_type, seq, payload, self.tx_frame_size):
             self._callback(frame)
+
+
+async def wait_online(session, timeout=5.0):
+    """Wait until the session is connected to the broker and subscribed to its topics.
+
+    Messages the cloud publishes before that would not reach the gateway (the broker
+    keeps only retained ones).
+    """
+    async def _wait():
+        while not session.cloud_online:
+            await asyncio.sleep(0.01)
+    await asyncio.wait_for(_wait(), timeout)

@@ -84,7 +84,7 @@ class DeviceSession:
         self.dropped = 0  # messages lost to a full buffer
         self.rejected = 0  # messages from the device that could not be reassembled
         self.discarded = 0  # buffered messages lost because the session ended
-        self.cloud_online = False  # whether the MQTT connection is up
+        self.cloud_online = False  # whether the MQTT connection is up and subscribed
         self.started: float | None = None  # when the device was set up (time.monotonic())
         # The device's minimal log severity: as it last reported it, or as the cloud last
         # set it. Only for the log; None until known.
@@ -237,7 +237,6 @@ class DeviceSession:
             try:
                 await connection.connect()
                 connected_at = time.monotonic()
-                self.cloud_online = True
                 self._log_connected(offline_since)
                 offline_since = None
                 # Session metadata must precede telemetry on every MQTT session.
@@ -255,6 +254,7 @@ class DeviceSession:
                     self._notifying = True
                 for route in self._routes.values():
                     await connection.subscribe(route.topic, qos=route.qos)
+                self.cloud_online = True  # connected and subscribed
                 await self._serve(connection)
                 return
             except cloud.CloudError as exc:

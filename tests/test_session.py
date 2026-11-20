@@ -14,7 +14,7 @@ from spotflow_gateway.protocol import MessageType
 from spotflow_gateway.session import C2D_ROUTES, DeviceSession, SessionError
 from spotflow_gateway.status import Counts
 
-from .conftest import FakeLink, publish
+from .conftest import FakeLink, publish, wait_online
 
 
 def settings_for(broker):
@@ -26,7 +26,7 @@ async def test_forwards_session_metadata_then_telemetry(broker, recorder):
     session = DeviceSession(link, settings_for(broker))
     task = asyncio.create_task(session.run())
 
-    await asyncio.wait_for(link.notifying.wait(), 5)
+    await wait_online(session)
     big = bytes(range(256)) * 4  # spans many 20-byte frames
     link.send(MessageType.TELEMETRY, b"log-1")
     link.send(MessageType.TELEMETRY, big)
@@ -53,8 +53,9 @@ async def test_forwards_session_metadata_then_telemetry(broker, recorder):
 async def test_mqtt_reconnect_republishes_metadata_and_keeps_messages(broker, recorder, caplog):
     caplog.set_level(logging.INFO)
     link = FakeLink(metadata=b"META")
-    task = asyncio.create_task(DeviceSession(link, settings_for(broker)).run())
-    await asyncio.wait_for(link.notifying.wait(), 5)
+    session = DeviceSession(link, settings_for(broker))
+    task = asyncio.create_task(session.run())
+    await wait_online(session)
     link.send(MessageType.TELEMETRY, b"before")
     await recorder.wait_for(2)
 
@@ -108,8 +109,9 @@ REPORTED_V1 = bytes([0xA4, 0x00, 0x04, 0x10, 0x18, 0x28, 0x11, 0x18, 0x1E, 0x13,
 
 async def test_remote_log_severity_roundtrip(broker, recorder):
     link = FakeLink(metadata=b"META")
-    task = asyncio.create_task(DeviceSession(link, settings_for(broker)).run())
-    await asyncio.wait_for(link.notifying.wait(), 5)
+    session = DeviceSession(link, settings_for(broker))
+    task = asyncio.create_task(session.run())
+    await wait_online(session)
 
     await publish(broker, "config-cbor-c2d", DESIRED_ERROR_V1)
     await link.wait_received(1)
@@ -148,8 +150,9 @@ async def test_configuration_sent_on_subscription_is_acknowledged_first_time(bro
 
 async def test_config_resubscribed_after_mqtt_reconnect(broker, recorder):
     link = FakeLink(metadata=b"META")
-    task = asyncio.create_task(DeviceSession(link, settings_for(broker)).run())
-    await asyncio.wait_for(link.notifying.wait(), 5)
+    session = DeviceSession(link, settings_for(broker))
+    task = asyncio.create_task(session.run())
+    await wait_online(session)
     await recorder.wait_for(1)
 
     link.metadata_gate = asyncio.Event()
@@ -173,8 +176,9 @@ async def test_config_resubscribed_after_mqtt_reconnect(broker, recorder):
 
 async def test_legacy_device_gets_config_without_ack_flag(broker, recorder):
     link = FakeLink(capabilities=b"\x01")
-    task = asyncio.create_task(DeviceSession(link, settings_for(broker)).run())
-    await asyncio.wait_for(link.notifying.wait(), 5)
+    session = DeviceSession(link, settings_for(broker))
+    task = asyncio.create_task(session.run())
+    await wait_online(session)
 
     await publish(broker, "config-cbor-c2d", DESIRED_ERROR_V1)
     await link.wait_received(1)
@@ -434,8 +438,9 @@ def test_reported_configuration_is_logged(caplog):
 async def test_desired_configuration_delivery_names_the_change(broker, recorder, caplog):
     caplog.set_level(logging.INFO)
     link = FakeLink(capabilities=b"\x01")
-    task = asyncio.create_task(DeviceSession(link, settings_for(broker)).run())
-    await asyncio.wait_for(link.notifying.wait(), 5)
+    session = DeviceSession(link, settings_for(broker))
+    task = asyncio.create_task(session.run())
+    await wait_online(session)
     link.send(MessageType.REPORTED_CONFIGURATION, REPORTED_AT_STARTUP)
     await recorder.wait_for(2)
 

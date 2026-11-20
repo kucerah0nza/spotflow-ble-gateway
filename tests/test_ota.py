@@ -11,7 +11,7 @@ from spotflow_gateway.artifacts import Status
 from spotflow_gateway.protocol import FrameFlags, MessageType
 from spotflow_gateway.session import DeviceSession, SessionError
 
-from .conftest import FakeLink, publish
+from .conftest import FakeLink, publish, wait_online
 from .test_artifacts import FIRMWARE, SECRET, Origin, close_req, make_cache, open_req, read_req
 
 MANIFEST = b"\xa4\x00\x06\x18\x20\x01..."  # opaque to the gateway
@@ -26,7 +26,7 @@ async def start(broker, tmp_path, capabilities=b"\x01\x01\x01", tx_frame_size=20
     settings = cloud.CloudSettings(ingest_key="k", host="127.0.0.1", port=broker.port, tls=False)
     session = DeviceSession(link, settings, cache)
     task = asyncio.create_task(session.run())
-    await asyncio.wait_for(link.notifying.wait(), 5)
+    await wait_online(session)
     return link, session, task, origin
 
 
