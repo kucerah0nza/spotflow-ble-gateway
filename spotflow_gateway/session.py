@@ -243,14 +243,18 @@ class DeviceSession:
                 # Session metadata must precede telemetry on every MQTT session.
                 metadata = await self.link.read(protocol.SESSION_METADATA_UUID)
                 await connection.publish(cloud.TOPIC_INGEST_CBOR, metadata, qos=0)
-                # Subscribe before enabling notifications: the device reports its
-                # configuration right away, and the cloud sends pending OTA commands
-                # as soon as the subscription exists.
-                for route in self._routes.values():
-                    await connection.subscribe(route.topic, qos=route.qos)
+                # Enable notifications before subscribing. The cloud sends the desired
+                # configuration and pending OTA commands as soon as the subscription
+                # exists, and the device can acknowledge them only once notifications
+                # are on: before that, its ACKs are dropped and every command would be
+                # resent after a timeout. What the device sends meanwhile (it reports
+                # its configuration right away) is buffered, and published only in
+                # _serve(), once the subscriptions are in place to receive any answer.
                 if not self._notifying:
                     await self.link.start_notify(self._on_frame)
                     self._notifying = True
+                for route in self._routes.values():
+                    await connection.subscribe(route.topic, qos=route.qos)
                 await self._serve(connection)
                 return
             except cloud.CloudError as exc:

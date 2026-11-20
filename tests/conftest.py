@@ -238,20 +238,24 @@ async def mini_broker():
         await broker.stop()
 
 
-def _publish_blocking(port, topic, payload, qos):
+def _publish_blocking(port, topic, payload, qos, retain):
     client = mqtt.Client(CallbackAPIVersion.VERSION2)
     client.connect("127.0.0.1", port)
     client.loop_start()
     try:
-        client.publish(topic, payload, qos=qos).wait_for_publish(5)
+        client.publish(topic, payload, qos=qos, retain=retain).wait_for_publish(5)
     finally:
         client.disconnect()
         client.loop_stop()
 
 
-async def publish(broker, topic, payload, qos=1):
-    """Publish one message to the test broker, as the cloud would."""
-    await asyncio.to_thread(_publish_blocking, broker.port, topic, payload, qos)
+async def publish(broker, topic, payload, qos=1, retain=False):
+    """Publish one message to the test broker, as the cloud would.
+
+    A retained message reaches the gateway as soon as it subscribes, like the desired
+    configuration that the cloud sends to every new subscription.
+    """
+    await asyncio.to_thread(_publish_blocking, broker.port, topic, payload, qos, retain)
 
 
 class FakeLink:
@@ -281,6 +285,7 @@ class FakeLink:
         # before anything is published) waits for it. Lets tests hold a reconnect.
         self.metadata_gate: asyncio.Event | None = None
         self.tx_frame_size = 20  # frames the device sends (ATT MTU - 3)
+        self.notify_delay = 0.0
 
     async def read(self, uuid):
         if uuid == protocol.SESSION_METADATA_UUID and self.metadata_gate is not None:
@@ -288,6 +293,8 @@ class FakeLink:
         return self.values[uuid]
 
     async def start_notify(self, callback):
+        # Enabling notifications is a GATT write: it takes a while over a real link.
+        await asyncio.sleep(self.notify_delay)
         self._callback = callback
         self.notifying.set()
 
@@ -300,7 +307,9 @@ class FakeLink:
         self.received_changed.set()
         if result.needs_ack:
             reply = self.ack_replies.pop(0) if self.ack_replies else True
-            if reply is not None:
+            # Like the Device SDK, the device cannot send an ACK or NACK before the
+            # gateway has enabled notifications: it is dropped.
+            if reply is not None and self.notifying.is_set():
                 control = protocol.encode_control(reply, result.message_type, result.sequence)
                 asyncio.get_running_loop().call_soon(self._callback, control)
 

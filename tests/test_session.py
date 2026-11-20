@@ -127,6 +127,25 @@ async def test_remote_log_severity_roundtrip(broker, recorder):
     await asyncio.wait_for(task, 5)
 
 
+async def test_configuration_sent_on_subscription_is_acknowledged_first_time(broker, caplog):
+    # The cloud sends the desired configuration as soon as the gateway subscribes. The
+    # device can only acknowledge it once notifications are enabled, so they must be
+    # enabled before subscribing; otherwise the ACK is lost and the gateway resends.
+    caplog.set_level(logging.INFO)
+    await publish(broker, "config-cbor-c2d", DESIRED_ERROR_V1, retain=True)
+    link = FakeLink()
+    link.notify_delay = 0.2
+    task = asyncio.create_task(DeviceSession(link, settings_for(broker)).run())
+    await link.wait_received(1)
+    await asyncio.sleep(0.5)  # an ACK would have arrived by now
+    link.disconnected.set()
+    await asyncio.wait_for(task, 5)
+    assert len(link.received) == 1
+    assert not [m for m in caplog.messages if "not acknowledged" in m]
+    assert any(m.startswith("[test-device] -> device DESIRED_CONFIGURATION (8 bytes), acknowledged")
+               for m in caplog.messages)
+
+
 async def test_config_resubscribed_after_mqtt_reconnect(broker, recorder):
     link = FakeLink(metadata=b"META")
     task = asyncio.create_task(DeviceSession(link, settings_for(broker)).run())

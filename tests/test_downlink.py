@@ -19,6 +19,7 @@ async def setup():
         channel = DownlinkChannel(link, MessageType.DESIRED_CONFIGURATION, needs_ack, **kwargs)
         reassembler = protocol.Reassembler()
         link._callback = lambda frame: channel.on_control(reassembler.feed(frame))
+        link.notifying.set()  # as the session would have done before any delivery
         tasks.append(asyncio.create_task(channel.run()))
         return channel
 
